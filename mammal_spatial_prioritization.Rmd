@@ -1,0 +1,3193 @@
+---
+title: "mammal_spatial_prioritization"
+output: html_document
+---
+
+```{r eval=FALSE, include=FALSE}
+library(fasterRaster)  
+faster(grassDir = "C:/Program Files/GRASS GIS 8.4")
+```
+
+# Setup
+
+```{r}
+library(data.table)
+library(terra)
+library(sf)
+
+# ------------------------------------------------------------
+# Logging helper
+# ------------------------------------------------------------
+.log_console <- function(tag, fmt, ...) {
+  ts  <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+  msg <- if (length(list(...))) sprintf(fmt, ...) else fmt
+  cat(sprintf("[%s] [%s] %s\n", ts, tag, msg), sep = "")
+}
+
+# ------------------------------------------------------------
+# 1. Setup and Preconditions
+# ------------------------------------------------------------
+
+target_species <- c(
+  "cheirogaleus major",
+  "cheirogaleus medius",
+  "cryptoprocta ferox",
+  "echinops telfairi",
+  "eliurus majori",
+  "eliurus minor",
+  "eliurus myoxinus",
+  "eliurus tanala",
+  "eliurus webbi",
+  "eulemur albifrons",
+  "eulemur coronatus",
+  "eulemur fulvus",
+  "eulemur rubriventer",
+  "eulemur rufus",
+  "fossa fossana",
+  "galidia elegans",
+  "gymnuromys roberti",
+  "hapalemur griseus",
+  "hemicentetes semispinosus",
+  "indri indri",
+  "lepilemur edwardsi",
+  "lepilemur leucopus",
+  "lepilemur mustelinus",
+  "lepilemur ruficaudatus",
+  "microcebus murinus",
+  "microcebus rufus",
+  "microgale brevicaudata",
+  "microgale cowani",
+  "microgale gymnorhyncha",
+  "microgale longicaudata",
+  "microgale parvula",
+  "microgale principula",
+  "microgale soricoides",
+  "microgale taiva",
+  "nesomys rufus",
+  "oryzorictes hova",
+  "setifer setosus",
+  "tenrec ecaudatus",
+  "varecia variegata"
+)
+
+# Load species parameters
+params <- fread("Data/Clean/mammal_data.csv")[
+  scientific_resolved %in% target_species,
+  .(
+    species          = gsub(" ", "_", scientific_resolved),
+    min_patch_size,
+    min_patch_size500,
+    a_pred,
+    b_pred,
+    density,
+    dispersal_dist
+  )
+]
+setkey(params, species)
+
+.log_console(
+  "setup_params",
+  "Loaded params for %d species (target list length=%d).",
+  nrow(params), length(target_species)
+)
+
+# Load patch raster stack (one layer per species) and invariants
+patch_stack <- rast(file.path("Spatial", "Patches", paste0(params$species, ".tif")))
+names(patch_stack) <- params$species
+template_rast <- patch_stack[[1]]
+
+# Per-cell area (km^2) and static adjacency
+cs_vals <- as.numeric(values(cellSize(template_rast, unit = "km"), mat = TRUE)[, 1])
+rook_pairs_all <- adjacent(
+  template_rast,
+  cells      = seq_len(ncell(template_rast)),
+  directions = 4,
+  pairs      = TRUE
+)
+
+.log_console(
+  "setup_rasters",
+  "Loaded patch_stack with %d layers and %d cells; mean cell area=%.4f km^2.",
+  nlyr(patch_stack), ncell(template_rast), mean(cs_vals, na.rm = TRUE)
+)
+.log_console(
+  "setup_rook",
+  "Computed rook adjacency with %d neighbour pairs.",
+  nrow(rook_pairs_all)
+)
+
+# Load lookup tables and filter to focal species
+patch_dt <- as.data.table(readRDS("Spatial/all_patch_lookup.rds"))[
+  species %in% params$species
+]
+setkey(patch_dt, species, patch_id)
+
+.log_console(
+  "setup_patch_pu",
+  "Loaded patch_dt with %d rows (%d species, %d PUs); pu_dt has %d rows.",
+  nrow(patch_dt),
+  length(unique(patch_dt$species)),
+  length(unique(patch_dt$pu_id)),
+  nrow(pu_dt)
+)
+
+# Load and filter connectivity state_env
+state_env_all <- readRDS("Spatial/all_connectivity.rds")
+state_env <- state_env_all[
+  sapply(strsplit(names(state_env_all), "\\|"), `[`, 1) %in% params$species
+]
+rm(state_env_all)
+
+log_sp_from_state <- unique(vapply(strsplit(names(state_env), "\\|"), `[`, character(1L), 1))
+.log_console(
+  "setup_state_env",
+  "Loaded state_env with %d PU graphs across %d species.",
+  length(state_env), length(log_sp_from_state)
+)
+
+# ------------------------------
+# Preconditions: Validate inputs
+# ------------------------------
+# All species in patch_dt and patch_stack must be in params
+species_in_data <- unique(c(patch_dt$species, names(patch_stack)))
+if (!all(species_in_data %in% params$species)) {
+  bad <- setdiff(species_in_data, params$species)
+  .log_console(
+    "preconditions_error",
+    "Species in data missing from params: %s",
+    paste(bad, collapse = ", ")
+  )
+  stop("Mismatch: Some species in data are missing from params.")
+}
+if (!all(params$species %in% species_in_data)) {
+  missing_data <- setdiff(params$species, species_in_data)
+  .log_console(
+    "preconditions_warn",
+    "Params include %d species with no data in patch_dt/patch_stack: %s",
+    length(missing_data),
+    paste(missing_data, collapse = ", ")
+  )
+  warning("Some species in params have no data in patch_dt or patch_stack.")
+}
+
+# Check that key parameters are positive and finite
+check_vals <- function(x, name) {
+  if (any(!(is.finite(x) & x > 0))) {
+    .log_console("preconditions_error", "Parameter %s has non-finite or non-positive values.", name)
+    stop(paste("Parameter", name, "must be > 0 and finite for all species."))
+  }
+}
+check_vals(params$min_patch_size,    "min_patch_size")
+check_vals(params$min_patch_size500, "min_patch_size500")
+check_vals(params$a_pred,            "a_pred")
+check_vals(params$b_pred,            "b_pred")
+check_vals(params$density,           "density")
+check_vals(params$dispersal_dist,    "dispersal_dist")
+
+.log_console(
+  "preconditions_ok",
+  "Precondition checks passed for %d species.",
+  nrow(params)
+)
+```
+
+# Pruning orchestrator
+
+```{r}
+# ------------------------------------------------------------
+# 2. Helper Functions
+# ------------------------------------------------------------
+
+# ------------------------------------------------------------
+# Connected components in a PU connectivity graph (CSR format)
+#
+# Purpose:
+#   Given a PU-level graph (nodes = patches, edges = adjacency within a PU),
+#   restricted to a subset of "alive" patches, this function:
+#     1) Finds connected components among alive patches (using BFS).
+#     2) Assigns each patch a component label.
+#     3) Computes the total area in each connected component.
+#
+# Inputs:
+#   row_ptr, col_idx : CSR representation of an undirected graph where
+#                      nodes = patches (1..N), edges = adjacency within a PU.
+#                      - row_ptr has length N+1 (0-based offsets):
+#                           neighbors of node i are col_idx[(row_ptr[i]+1):row_ptr[i+1]]
+#                      - col_idx holds neighbor node indices (1..N).
+#   alive            : logical vector, length N, TRUE where patch is still present.
+#   patch_area       : numeric vector, length N, area of each patch (same ordering as alive).
+#
+# Outputs:
+#   comp_id   : integer vector, length N, component label per patch:
+#                 0  = patch is not alive or not visited,
+#                 1..K = component IDs for the K connected components.
+#   comp_area : numeric vector, length K, total area for each component (sum of patch_area).
+# ------------------------------------------------------------
+.compute_components <- function(row_ptr, col_idx, alive, patch_area) {
+  N       <- length(alive)        # number of patches (graph nodes) in this PU
+  comp_id <- integer(N)           # component label per node; initialized to 0 (unlabeled)
+  q       <- integer(N)           # pre-allocated BFS queue (stores node indices)
+  lab     <- 0L                   # current component label (incremented per component)
+  qs      <- 1L                   # queue start index (head)
+  qe      <- 0L                   # queue end index (tail)
+
+  # Loop over all nodes; start a BFS from any alive node that is not yet labeled.
+  # Each BFS identifies one connected component.
+  for (u in seq_len(N)) {
+    if (alive[u] && comp_id[u] == 0L) {
+      # Start a new component from node u
+      lab <- lab + 1L             # assign next component label
+      comp_id[u] <- lab           # label starting node
+      qe <- qe + 1L               # enqueue u at buffer position qe
+      q[qe] <- u
+
+      # Standard BFS over the CSR adjacency structure
+      while (qs <= qe) {
+        v <- q[qs]                # dequeue next node index
+        qs <- qs + 1L
+        # Convert CSR row pointers to 1-based R indices; neighbors of v are in [s:e]
+        s <- row_ptr[v] + 1L
+        e <- row_ptr[v + 1L]
+
+        # If v has neighbors recorded in CSR, traverse them
+        if (e >= s) {
+          for (idx in s:e) {
+            w <- col_idx[idx]     # neighbor node index
+            # Visit neighbor if it is alive and not yet assigned to a component
+            if (alive[w] && comp_id[w] == 0L) {
+              comp_id[w] <- lab   # assign same component label as v
+              qe <- qe + 1L       # enqueue neighbor
+              q[qe] <- w
+            }
+          }
+        }
+      }
+    }
+  }
+
+  # Compute total area per non-zero component.
+  # We only sum areas for nodes that have a component label > 0.
+  ok <- comp_id > 0L
+  comp_area <- as.numeric(
+    rowsum(
+      patch_area[ok],   # areas of labeled patches
+      comp_id[ok],      # group by component ID
+      reorder = FALSE
+    )
+  )
+
+  list(comp_id = comp_id, comp_area = comp_area)
+}
+
+# ------------------------------------------------------------
+# Rebuild a CSR graph restricted to a subset of nodes
+#
+# Purpose:
+#   Given a CSR graph and a subset of node indices (keep_idx), construct the
+#   induced subgraph on those nodes, renumbering them consecutively 1..K and
+#   removing any edges that go to dropped nodes.
+#
+# Inputs:
+#   row_ptr, col_idx : original CSR adjacency (same interpretation as above).
+#   keep_idx         : integer vector of original node indices (1..N) to keep.
+#
+# Outputs:
+#   row_ptr, col_idx : CSR adjacency for the induced subgraph on keep_idx,
+#                      with nodes renumbered 1..K in the order of keep_idx.
+# ------------------------------------------------------------
+.rebuild_csr <- function(row_ptr, col_idx, keep_idx) {
+  K   <- length(keep_idx)                   # number of nodes to keep
+  # map[old_index] = new_index (1..K) or 0 if dropped
+  map <- integer(length(row_ptr) - 1L)      # graph originally has length(row_ptr)-1 nodes
+  map[keep_idx] <- seq_len(K)
+  row_new <- integer(K + 1L)                # new CSR row pointer (for K nodes)
+
+  # --------------------------------------------------------
+  # First pass: compute how many neighbors each kept node will have
+  #             after we restrict to keep_idx and renumber.
+  # --------------------------------------------------------
+  for (ii in seq_len(K)) {
+    i <- keep_idx[ii]                       # original node index for new node ii
+    s <- row_ptr[i] + 1L                   # starting col_idx position for node i
+    e <- row_ptr[i + 1L]                   # ending   col_idx position for node i
+
+    if (e >= s) {
+      neigh <- col_idx[s:e]                # neighbors in old indexing
+      nn    <- unique(map[neigh])          # map neighbors to new indices (0 = dropped)
+      nn    <- nn[nn > 0L]                 # keep only neighbors that are in keep_idx
+      # row_new[ii+1] = total number of neighbor slots up to node ii (prefix sum)
+      row_new[ii + 1L] <- row_new[ii] + length(nn)
+    } else {
+      # node has no neighbors; adjacency size stays the same
+      row_new[ii + 1L] <- row_new[ii]
+    }
+  }
+
+  # Allocate new column index vector to exactly the required length.
+  col_new <- integer(row_new[K + 1L])
+  wp      <- 1L   # write pointer into col_new
+
+  # --------------------------------------------------------
+  # Second pass: fill the new column indices (adjacency list)
+  #              for each kept node using the mapping.
+  # --------------------------------------------------------
+  for (ii in seq_len(K)) {
+    i <- keep_idx[ii]                       # original node index
+    s <- row_ptr[i] + 1L
+    e <- row_ptr[i + 1L]
+    if (e >= s) {
+      neigh <- col_idx[s:e]                # old neighbors
+      nn    <- unique(map[neigh])          # mapped new neighbors (0 if dropped)
+      nn    <- nn[nn > 0L]                 # keep only those that remain in subgraph
+      len   <- length(nn)
+      if (len > 0) {
+        # Write the neighbor indices into col_new and advance the write pointer
+        col_new[wp:(wp + len - 1L)] <- nn
+        wp <- wp + len
+      }
+    }
+  }
+
+  list(row_ptr = row_new, col_idx = col_new)
+}
+
+# ------------------------------------------------------------
+# Update components of a PU after some patches die
+#
+# Purpose:
+#   Given a PU connectivity graph and a logical vector of "alive" patches,
+#   this function:
+#     1) Finds connected components among surviving patches.
+#     2) For each component, checks if its total area >= PU area threshold.
+#     3) Keeps viable components, possibly splitting the PU into multiple PUs.
+#     4) Drops patches in sub-threshold components.
+#
+# Given:
+#   - 'conn'       : list describing one PU CSR graph, with fields:
+#                      conn$pu_id    : current PU ID
+#                      conn$id2patch : integer vector mapping node index -> patch_id
+#                      conn$row_ptr  : CSR row pointer
+#                      conn$col_idx  : CSR column indices
+#   - 'alive_nodes': logical vector, TRUE where patch still exists (same order as conn$id2patch)
+#   - 'patch_area' : numeric vector of patch areas, same length as alive_nodes
+#   - 'thr'        : minimum total area (km^2) required for a component to be viable as a PU
+#   - 'next_pu_id' : next available PU ID for newly created PUs (species-specific counter)
+#
+# Returns:
+#   - csr_list     : list of new PU CSR objects (one per surviving component),
+#                    each with fields (pu_id, id2patch, row_ptr, col_idx).
+#                    If there's only one viable component, it may keep the original pu_id.
+#   - drop_patches : vector of patch_ids (conn$id2patch subset) that belong to
+#                    sub-threshold components and should be removed from patch_dt.
+#   - next_pu_id   : updated next PU ID (after assigning new IDs to split components).
+# ------------------------------------------------------------
+.update_pu_components <- function(conn, alive_nodes, patch_area, thr, next_pu_id) {
+  n_alive <- sum(alive_nodes)  # number of nodes still alive in this PU graph
+
+  # --------------------------------------------------------
+  # Case 1: no surviving patches → entire PU vanishes.
+  #         No CSR objects remain; no patches to drop (they should already be marked dead).
+  # --------------------------------------------------------
+  if (n_alive == 0L) {
+    return(list(
+      csr_list     = list(),
+      drop_patches = integer(0L),
+      next_pu_id   = next_pu_id
+    ))
+  }
+
+  # --------------------------------------------------------
+  # Case 2: exactly one surviving patch
+  #         Either we keep it as a single-node PU or drop it if below thr.
+  # --------------------------------------------------------
+  if (n_alive == 1L) {
+    idx_alive  <- which(alive_nodes)[1L]   # position of the single alive node
+    area_alive <- patch_area[idx_alive]    # area of that patch
+
+    # If that single patch is below the PU threshold, the PU is non-viable.
+    if (area_alive < thr) {
+      return(list(
+        csr_list     = list(),                     # no surviving PU
+        drop_patches = conn$id2patch[idx_alive],   # this patch is dropped
+        next_pu_id   = next_pu_id
+      ))
+    }
+
+    # Otherwise keep a single-node PU with no edges (CSR has 2 row_ptr entries, no col_idx)
+    csr_obj <- list(
+      pu_id    = conn$pu_id,                       # retain original PU ID
+      id2patch = conn$id2patch[idx_alive],         # single surviving patch
+      row_ptr  = c(0L, 0L),                        # no neighbors
+      col_idx  = integer(0L)
+    )
+    return(list(
+      csr_list     = list(csr_obj),                # one surviving component
+      drop_patches = integer(0L),                  # nothing to drop
+      next_pu_id   = next_pu_id
+    ))
+  }
+
+  # --------------------------------------------------------
+  # Case 3: general case with multiple surviving patches
+  #         Find connected components and split the PU accordingly.
+  # --------------------------------------------------------
+
+  # Compute connected components on the surviving nodes, and their total areas.
+  comps     <- .compute_components(conn$row_ptr, conn$col_idx, alive_nodes, patch_area)
+  comp_id   <- comps$comp_id   # component label per node (0 = dead)
+  comp_area <- comps$comp_area # total area per component, indexed by component label
+
+  # Identify components above/below the PU area threshold
+  keep_labels <- which(comp_area >= thr)  # component labels that remain as PUs
+  drop_labels <- which(comp_area <  thr)  # component labels that are non-viable
+  k_keep      <- length(keep_labels)      # number of surviving components
+
+  # Pre-allocate list for CSR objects of surviving components
+  csr_list <- vector("list", k_keep)
+
+  # --------------------------------------------------------
+  # Build CSR objects for each surviving (kept) component.
+  # If there are multiple kept components, we may create new PU IDs.
+  # --------------------------------------------------------
+  if (k_keep > 0L) {
+    pu_id <- conn$pu_id  # original PU ID
+
+    # If PU splits into several viable components:
+    #   - the first keeps the original PU ID,
+    #   - the remaining components get new PU IDs from 'next_pu_id + 1 ..'.
+    if (k_keep > 1L) {
+      pu_ids     <- c(pu_id, next_pu_id + seq_len(k_keep - 1L))
+      next_pu_id <- pu_ids[k_keep]        # advance 'next_pu_id' to the last newly used ID
+    } else {
+      pu_ids <- pu_id                     # single component retains original ID
+    }
+
+    # For each surviving component, restrict the graph to nodes within that component.
+    for (j in seq_along(keep_labels)) {
+      lab       <- keep_labels[j]                      # component label
+      nodes_lab <- which(comp_id == lab)              # node indices in this component
+      newg      <- .rebuild_csr(conn$row_ptr, conn$col_idx, nodes_lab)
+
+      csr_list[[j]] <- list(
+        pu_id    = pu_ids[j],                         # assigned PU ID for this component
+        id2patch = conn$id2patch[nodes_lab],          # patch IDs in this component
+        row_ptr  = newg$row_ptr,                      # component CSR row pointer
+        col_idx  = newg$col_idx                       # component CSR column indices
+      )
+    }
+  }
+
+  # --------------------------------------------------------
+  # Identify patches that belong to sub-threshold components.
+  # Their patch IDs will be returned as 'drop_patches'.
+  # --------------------------------------------------------
+  if (length(drop_labels) > 0L) {
+    # drop_nodes = node indices whose component label is in drop_labels
+    drop_nodes <- which(comp_id %in% drop_labels)
+  } else {
+    drop_nodes <- integer(0L)
+  }
+  drop_patches <- conn$id2patch[drop_nodes]  # convert node indices to patch IDs
+
+  list(
+    csr_list     = csr_list,
+    drop_patches = drop_patches,
+    next_pu_id   = next_pu_id
+  )
+}
+
+# ------------------------------------------------------------
+# Compute PU-level log-values for scoring edge cells
+#
+# Purpose:
+#   For each (species, PU), compute log(∂S/∂A_i), i.e. the log of the
+#   marginal effect of a small change in PU area A_i on the species-level
+#   persistence S, under a Gompertz-type persistence model anchored at
+#   the "500 individuals" threshold.
+#
+# Inputs:
+#   pu_dt  : data.table with columns:
+#              - species      : species identifier
+#              - pu_id        : population unit ID
+#              - pu_area_km2  : total PU area (km^2)
+#   params : data.table keyed by species, with columns:
+#              - density           : indiv / km^2
+#              - a_pred, b_pred    : Gompertz parameters
+#              - min_patch_size500 : area threshold for 500 individuals (km^2)
+#
+# Output:
+#   data.table with columns (species, pu_id, log_val), where:
+#     log_val = log(∂S/∂A_i) for that (species, PU).
+# ------------------------------------------------------------
+.compute_log_val <- function(pu_dt, params) {
+  # Join PU areas with species parameters, by species.
+  # 'pu_data' contains one row per (species, pu_id) with all needed columns.
+  pu_data <- params[pu_dt, on = .(species)]
+
+  # Short aliases for readability
+  A    <- pu_data$pu_area_km2          # PU area (km^2)
+  dens <- pu_data$density              # individuals per km^2
+  a    <- pu_data$a_pred               # Gompertz parameter a
+  b    <- pu_data$b_pred               # Gompertz parameter b
+  c_th <- pu_data$min_patch_size500    # area threshold corresponding to 500 individuals
+  sp   <- pu_data$species              # species ID per PU
+
+  # Area above the 500-individual threshold (delta must be > 0 for model to make sense)
+  delta    <- A - c_th
+  logdelta <- log(delta)
+
+  # Combine a, b, and density into one log-term:
+  #   log_a2 = log(a * dens^{-b}) = log(a) - b * log(dens)
+  log_a2 <- log(a) - b * log(dens)
+
+  # Intermediate:
+  #   y = log_a2 - b * log(delta)
+  #     = log(a * dens^{-b} * delta^{-b})
+  y   <- log_a2 - b * logdelta
+  e_y <- exp(y)
+
+  # PU-level persistence probability:
+  #   P_i = exp(-exp(y)) = exp(-e^y)
+  P_i    <- exp(-e_y)
+
+  # log(1 - P_i) per PU (log of extinction probability in that PU)
+  log1mP <- log1p(-P_i)
+
+  # For each species, sum log(1 - P_i) across all its PUs.
+  # This is log of product over PUs: log(∏_i (1 - P_i)).
+  sum_log1mP <- tapply(log1mP, sp, sum)
+
+  # For each PU, compute:
+  #   log Q_i = log(∏_{j≠i} (1 - P_j))
+  #           = [Σ_j log(1 - P_j)] - log(1 - P_i)
+  log_Qi <- sum_log1mP[sp] - log1mP
+
+  # Derivative of P_i with respect to area A in log form:
+  #   log(∂P_i/∂A) = log_a2 + log(b) - (b + 1)*log(delta) - e^y
+  log_dP  <- log_a2 + log(b) - (b + 1) * logdelta - e_y
+
+  # Species-level derivative:
+  #   S = 1 - ∏_i (1 - P_i)
+  #   ∂S/∂A_i = (∂P_i/∂A_i) * ∏_{j≠i} (1 - P_j)
+  #            = exp(log_dP + log_Qi)
+  # We keep it in log-space:
+  log_val <- log_dP + log_Qi
+
+  data.table(
+    species = sp,
+    pu_id   = pu_data$pu_id,
+    log_val = log_val
+  )
+}
+
+# ------------------------------------------------------------
+# 3. Pruning Functions
+# ------------------------------------------------------------
+
+# ------------------------------------------------------------
+# Single pruning step:
+#   - identify edge cells,
+#   - score them by multi-species persistence loss if removed,
+#   - remove the lowest-impact cells,
+#   - update patch areas, PUs, and connectivity.
+#
+# Arguments:
+#   n_remove       : number of cells to remove in this step
+#   patch_dt       : patch lookup table with columns
+#                      (species, patch_id, pu_id, patch_area_km2)
+#   state_env      : named list of per-PU connectivity graphs (CSR format)
+#   count_alive    : integer vector, per-cell count of species currently present
+#   patch_vals_all : matrix [ncell x nspecies], patch IDs in each cell per species layer
+#   cs_vals        : numeric, per-cell area (km^2)
+#   rook_pairs_all : integer matrix [n_pairs x 2], rook-adjacent cell index pairs
+#   params         : species parameters (includes min_patch_size, min_patch_size500, etc.)
+#
+# Optional args (computed externally by caller for speed):
+#   species_layers : character vector, names of species layers (columns of patch_vals_all)
+#   sp_col         : named integer vector mapping species name -> column index
+#   thr_pu_vec     : named numeric vector, per-species PU area thresholds (min_patch_size500)
+#   vals_cache     : list of per-species patch ID vectors (one column of patch_vals_all per species)
+#
+# Returns:
+#   - removed_indices     : integer vector of cell indices that became empty in this step
+#   - edge_cell_count     : number of candidate edge cells considered
+#   - patch_dt            : updated patch table
+#   - state_env           : updated PU connectivity environment
+#   - count_alive         : updated per-cell alive counts
+#   - changed_patch_areas : data.table (species, patch_id) that had their area changed or were dropped
+# ------------------------------------------------------------
+prune_step_minimal <- function(
+  n_remove,
+  patch_dt,
+  state_env,
+  count_alive,
+  patch_vals_all,
+  cs_vals,
+  rook_pairs_all,
+  params,
+  species_layers = colnames(patch_vals_all),
+  sp_col         = setNames(seq_along(species_layers), species_layers),
+  thr_pu_vec     = setNames(params$min_patch_size500, params$species),
+  vals_cache     = lapply(seq_along(species_layers), function(j) patch_vals_all[, j])
+) {
+  # Name the per-species cache so we can look up a species' patch IDs quickly.
+  #   vals_cache[[sp]] = integer vector of patch IDs for species sp, one element per cell.
+  names(vals_cache) <- species_layers
+  get_vals_sp <- function(sp) vals_cache[[sp]]
+
+  # ------------------------------------------------------------------
+  # Aggregate total area per (species, pu_id) to get PU areas.
+  # This is the basis for PU-level log(∂S/∂A) scoring.
+  # ------------------------------------------------------------------
+  pu_dt <- patch_dt[
+    ,
+    .(pu_area_km2 = sum(patch_area_km2)),
+    by = .(species, pu_id)
+  ]
+
+  # Snapshot of patch-to-PU mapping before this pruning step, so we
+  # have a stable mapping even as patch_dt changes later.
+  patch_map_before <- patch_dt[, .(species, patch_id, pu_id)]
+
+  # Snapshot of cell-level alive counts to detect which cells become empty
+  # over the course of this pruning step.
+  count_before     <- count_alive
+
+  # ---------------------------
+  # 1) Identify edge cells
+  # ---------------------------
+  # A cell is "alive" if at least one species is present there.
+  alive     <- count_alive > 0L
+  alive_idx <- which(alive)          # indices of alive cells
+  edge_idx  <- integer(0L)          # will hold indices of edge cells
+
+  if (n_remove > 0L && length(alive_idx)) {
+    # 'both_alive' marks pairs of neighboring cells where both ends are alive.
+    both_alive <- alive[rook_pairs_all[, 1]] & alive[rook_pairs_all[, 2]]
+
+    # alive_pos maps global cell indices -> position in the alive_idx vector.
+    #   For each alive cell index i, alive_pos[i] = position of i in alive_idx.
+    alive_pos            <- integer(length(alive))
+    alive_pos[alive_idx] <- seq_along(alive_idx)
+
+    # For each neighbor pair where both cells are alive, record the "from" cell
+    # index in the alive_idx index space.
+    pos_in_alive <- alive_pos[rook_pairs_all[both_alive, 1]]
+
+    # Count how many alive neighbors each alive cell has (0..4 in rook adjacency)
+    #   deg_alive[k] = number of alive neighbors for alive_idx[k].
+    deg_alive <- tabulate(pos_in_alive, nbins = length(alive_idx))
+
+    # Edge cells = alive cells that do not have all 4 alive neighbors.
+    #   (i.e., they are on the boundary of the alive region)
+    edge_idx <- alive_idx[deg_alive < 4L]
+  }
+
+  edge_cell_count <- length(edge_idx)  # how many edge cells are candidates
+
+  # ---------------------------
+  # 2) Score edge cells
+  # ---------------------------
+  sel_idx         <- integer(0L)  # will store the selected cells to remove
+  patch_vals_edge <- NULL         # matrix of patch IDs for edge cells (subset of patch_vals_all)
+
+  if (edge_cell_count && n_remove > 0L) {
+    # Subset the patch ID matrix to edge cells only.
+    #   patch_vals_edge[row, species] = patch_id of that species at edge cell row.
+    patch_vals_edge <- patch_vals_all[edge_idx, , drop = FALSE]
+
+    # Compute PU-level log-values once for all PUs.
+    #   pu_val_dt: one row per (species, pu_id) with log_val = log(∂S/∂A) for that PU.
+    pu_val_dt <- .compute_log_val(pu_dt, params)
+
+    # Map each (species, patch_id) to its PU log-value.
+    # We join patch_map_before (species, patch_id, pu_id) to pu_val_dt on species, pu_id.
+    patch2score_dt <- patch_map_before[
+      pu_val_dt,
+      on = .(species, pu_id),
+      nomatch = 0L
+    ][
+      ,
+      .(species, patch_id = as.integer(patch_id), score = as.numeric(log_val))
+    ]
+
+    # For each species, build a small lookup structure:
+    #   pid   = vector of patch IDs for this species
+    #   score = corresponding PU log-values for those patch IDs
+    val_map <- lapply(
+      split(patch2score_dt, patch2score_dt$species),
+      function(d) list(pid = d$patch_id, score = d$score)
+    )
+
+    # Initialize per-edge-cell accumulators for log-sum-exp over species.
+    # We will compute:
+    #   score(cell) = -log( sum_species exp(log_val_species(PU_for_cell)) )
+    # using a numerically stable algorithm.
+    scores <- rep(-Inf, edge_cell_count)  # final multi-species score per edge cell
+    m      <- rep(-Inf, edge_cell_count)  # running max of log-values for log-sum-exp
+    S      <- numeric(edge_cell_count)    # accumulates sum exp(x - m)
+    have   <- logical(edge_cell_count)    # TRUE where at least one species contributed
+
+    # For each species, add its contribution to the log-sum-exp over species.
+    for (sp in names(val_map)) {
+      # patch IDs of this species at edge cells
+      pid_vec <- patch_vals_edge[, sp_col[[sp]]]
+      msp     <- val_map[[sp]]
+      # idx = positions in msp$pid for each patch ID at edge cells
+      idx     <- fastmatch::fmatch(pid_vec, msp$pid)
+      # x = log(∂S/∂A) for this species/PU for each edge cell (NA where no match)
+      x       <- msp$score[idx]
+      ok      <- is.finite(x)             # contributions that are defined
+
+      if (any(ok)) {
+        io <- which(ok)                   # edge cells where this species contributes
+        xo <- x[io]                       # log-values for these cells
+        mo <- m[io]                       # current max per cell
+
+        # For numerically stable log-sum-exp:
+        #   Let S[cell] = Σ exp(vals[cell] - m[cell]).
+        #   When a new value xo > m[cell] arrives, we rescale:
+        #     S_new = S_old * exp(m_old - xo) + 1
+        #     m_new = xo
+        better <- xo > mo
+        if (any(better)) {
+          ib    <- io[better]
+          S[ib] <- S[ib] * exp(mo[better] - xo[better]) + 1
+          m[ib] <- xo[better]
+        }
+        # Otherwise, if xo <= m[cell], we just add exp(xo - m[cell]) to S.
+        if (any(!better)) {
+          inb    <- io[!better]
+          S[inb] <- S[inb] + exp(xo[!better] - mo[!better])
+        }
+        # Mark these cells as having at least one species contribution
+        have[io] <- TRUE
+      }
+    }
+
+    # For cells with at least one species contribution, compute:
+    #   multi-species score = -log( sum_species exp(log_val_species) )
+    #                       = -log-sum-exp over species of log_val.
+    # Comments note that "lower (more negative) is worse" (higher impact),
+    # so higher values are more attractive for removal.
+    scores[have] <- -(m[have] + log(S[have]))
+    idx_all      <- which(is.finite(scores))  # cells with valid scores
+
+    if (length(idx_all)) {
+      s_sub  <- scores[idx_all]              # subset of scores to consider
+      n_sel  <- min(n_remove, length(s_sub)) # how many cells we can actually remove
+
+      # Find the cutoff score for the top n_sel cells (highest scores kept).
+      # Rfast::nth(..., descending=TRUE) returns the n_sel-th largest value.
+      cutoff <- Rfast::nth(
+        s_sub,
+        k            = n_sel,
+        descending   = TRUE,
+        index.return = FALSE
+      )
+
+      # Select all cells with score >= cutoff (candidate set, may include ties).
+      pick <- which(s_sub >= cutoff)
+
+      # If we have more than n_sel cells because of ties, break ties
+      # deterministically by:
+      #   1) higher scores first,
+      #   2) then smaller global cell index (edge_idx) as tiebreaker.
+      if (length(pick) > n_sel) {
+        o    <- order(-s_sub[pick], edge_idx[idx_all[pick]])
+        pick <- pick[o][seq_len(n_sel)]
+      }
+
+      # Map from positions within s_sub back to positions in edge_idx,
+      # then to global cell indices.
+      sel_idx <- edge_idx[idx_all[pick]]
+    }
+  }
+
+  # ---------------------------
+  # 3) Early exit if nothing to remove
+  # ---------------------------
+  if (!length(sel_idx)) {
+    return(list(
+      removed_indices     = integer(0L),
+      edge_cell_count     = edge_cell_count,
+      patch_dt            = patch_dt,
+      state_env           = state_env,
+      count_alive         = count_alive,
+      changed_patch_areas = data.table(species = character(), patch_id = integer())
+    ))
+  }
+
+  # ---------------------------
+  # 4) Kill selected cells
+  # ---------------------------
+  # At this point, sel_idx is the set of edge cells chosen for removal.
+  # Setting count_alive to 0 means no species remain in those cells.
+  # Patch and PU bookkeeping is handled in later steps.
+  count_alive[sel_idx] <- 0L
+
+  # ---------------------------
+  # 5) Attribute removed area to patches
+  # ---------------------------
+  # Each removed cell has area 'cs_vals[cell]'; this area is lost from
+  # whichever species' patches occupy that cell.
+  removed_cells_area <- cs_vals[sel_idx]
+
+  # edge_pos maps global cell indices 'sel_idx' back to row positions
+  # in edge_idx (and thus into patch_vals_edge).
+  edge_pos <- fastmatch::fmatch(sel_idx, edge_idx)
+
+  # Summarize area lost per (species, patch_id) as a data.table.
+  removed_area_by_patch <- rbindlist(
+    lapply(seq_along(species_layers), function(j) {
+      # patch IDs for species j at the removed cells
+      pid <- patch_vals_edge[edge_pos, j]
+      ok  <- !is.na(pid)
+      if (!any(ok)) return(NULL)
+
+      # rowsum: for each patch_id, sum the cell areas removed
+      #   a[patch_id] = Σ (cell area removed for this patch).
+      a <- rowsum(removed_cells_area[ok], pid[ok], reorder = FALSE)
+
+      data.table(
+        species      = species_layers[j],
+        patch_id     = as.integer(rownames(a)),
+        area_removed = as.numeric(a[, 1])
+      )
+    }),
+    use.names = TRUE,
+    fill      = TRUE
+  )
+
+  # ---------------------------
+  # 6) Update patch areas & drop sub-viable patches
+  # ---------------------------
+  # Join removed area back to the original (species, patch_id, pu_id)
+  # and subtract area_removed from patch_area_km2.
+  dec <- removed_area_by_patch[
+    patch_map_before,
+    on = .(species, patch_id),
+    nomatch = 0L
+  ][
+    ,
+    .(species, patch_id, pu_id, area_removed)
+  ]
+  # Remove duplicate rows so each (species, patch_id, pu_id) appears once
+  dec <- unique(dec, by = c("species", "patch_id", "pu_id"))
+
+  # Decrease patch areas by the amount of area removed in this step.
+  # NOTE: data.table "i." prefix refers to columns from the joined table (dec).
+  patch_dt[dec,
+           patch_area_km2 := patch_area_km2 - i.area_removed,
+           on = .(species, patch_id, pu_id)]
+
+  # Identify patches that now have zero or negative area; these are invalid.
+  zero_or_neg <- patch_dt[
+    !is.na(patch_area_km2) & patch_area_km2 <= 0,
+    .(species, patch_id)
+  ]
+  # Remove those patches from patch_dt entirely.
+  patch_dt <- patch_dt[!zero_or_neg, on = .(species, patch_id)]
+
+  # Drop patches whose area is now below the minimum patch size for their species.
+  drop_thr <- patch_dt[
+    params, on = .(species), nomatch = 0L
+  ][
+    patch_area_km2 < min_patch_size,
+    .(species, patch_id)
+  ]
+  if (nrow(drop_thr)) {
+    patch_dt <- patch_dt[!drop_thr, on = .(species, patch_id)]
+  }
+
+  # Collect all patches that were dropped (either zero/negative area or below threshold).
+  dropped_patches_all <- unique(
+    rbindlist(
+      list(zero_or_neg, drop_thr),
+      use.names = TRUE,
+      fill      = TRUE
+    )
+  )
+  # Ensure we have a non-empty data.table with consistent columns.
+  if (!nrow(dropped_patches_all)) {
+    dropped_patches_all <- data.table(species = character(), patch_id = integer())
+  }
+
+  # ---------------------------
+  # 7) Update PUs via .update_pu_components()
+  #     + enqueue ALL dropped patches for cell-level cleanup.
+  # ---------------------------
+  # pending_drop[sp] will store patch_ids for that species whose
+  # occurrences must be removed from rasters and count_alive.
+  pending_drop <- setNames(vector("list", length(species_layers)), species_layers)
+  names(pending_drop) <- species_layers
+
+  # Helper: add patch IDs to pending_drop[[sp]].
+  enqueue_drop <- function(sp, ids) {
+    if (!length(ids)) return(invisible(NULL))
+    cur <- pending_drop[[sp]]
+    pending_drop[[sp]] <<- unique(c(cur, as.integer(ids)))
+    invisible(NULL)
+  }
+
+  if (nrow(dropped_patches_all) > 0L) {
+    # Enqueue all dropped patches for later removal from rasters/count_alive.
+    dp <- split(dropped_patches_all$patch_id, dropped_patches_all$species)
+    for (sp in names(dp)) {
+      enqueue_drop(sp, dp[[sp]])
+    }
+
+    # Determine which PUs were affected by dropped patches,
+    # using the *old* patch-to-PU mapping (patch_map_before).
+    aff_pairs <- merge(
+      dropped_patches_all,
+      patch_map_before,
+      by = c("species", "patch_id")
+    )
+
+    # Process each species separately.
+    for (sp in unique(aff_pairs$species)) {
+      sp_rows <- aff_pairs$species == sp
+
+      # Group dropped patch_ids by their original PU ID.
+      by_pu <- split(aff_pairs$patch_id[sp_rows], aff_pairs$pu_id[sp_rows])
+
+      # Start new PU IDs for this species from the current max pu_id (if any).
+      next_pu_id <- if (any(patch_dt$species == sp)) {
+        max(patch_dt$pu_id[patch_dt$species == sp])
+      } else {
+        0L
+      }
+
+      thr_pu    <- thr_pu_vec[[sp]]   # species-specific PU area threshold (500 individuals)
+      pa_map_sp <- patch_dt[species == sp, .(patch_id, patch_area_km2)]
+
+      # For each PU that lost patches, recompute its components.
+      for (pu in names(by_pu)) {
+        pu_i <- as.integer(pu)
+        key  <- paste0(sp, "|", pu_i)
+        conn <- state_env[[key]]
+        if (is.null(conn)) next
+
+        id2patch    <- conn$id2patch
+        dead_ids    <- by_pu[[pu]]
+        N           <- length(id2patch)
+
+        # alive_nodes marks which patches in this PU still exist (not dropped).
+        alive_nodes <- rep(TRUE, N)
+        alive_nodes[id2patch %in% dead_ids] <- FALSE
+
+        # Build a patch_area vector (area per node) for the current PU.
+        # If a patch is missing in pa_map_sp, its area is left as 0.
+        pa  <- numeric(N)
+        idx <- fastmatch::fmatch(id2patch, pa_map_sp$patch_id)
+        ok  <- !is.na(idx)
+        pa[ok] <- pa_map_sp$patch_area_km2[idx[ok]]
+
+        # Split PU into components and drop sub-threshold components.
+        res <- .update_pu_components(
+          conn        = conn,
+          alive_nodes = alive_nodes,
+          patch_area  = pa,
+          thr         = thr_pu,
+          next_pu_id  = next_pu_id
+        )
+        next_pu_id <- res$next_pu_id
+
+        # Additional patch IDs that should be dropped because they belong
+        # to components that fail the PU area threshold.
+        drop_ids_comp <- res$drop_patches
+        if (length(drop_ids_comp) > 0L) {
+          enqueue_drop(sp, drop_ids_comp)
+          patch_dt <- patch_dt[!(species == sp & patch_id %in% drop_ids_comp)]
+        }
+
+        # Update PU connectivity in state_env based on surviving components.
+        csr_list <- res$csr_list
+        if (length(csr_list) == 0L) {
+          # Entire PU vanished → remove its CSR entry.
+          state_env[[key]] <- NULL
+        } else {
+          for (j in seq_along(csr_list)) {
+            cobj <- csr_list[[j]]
+
+            if (j == 1L) {
+              # First component keeps the original key and is overwritten.
+              state_env[[key]] <- list(
+                species  = sp,
+                pu_id    = cobj$pu_id,
+                id2patch = cobj$id2patch,
+                row_ptr  = cobj$row_ptr,
+                col_idx  = cobj$col_idx
+              )
+            } else {
+              # Additional components get new keys (new PUs).
+              new_key <- paste0(sp, "|", cobj$pu_id)
+              state_env[[new_key]] <- list(
+                species  = sp,
+                pu_id    = cobj$pu_id,
+                id2patch = cobj$id2patch,
+                row_ptr  = cobj$row_ptr,
+                col_idx  = cobj$col_idx
+              )
+            }
+
+            # Update patch_dt: patches in this component now belong to cobj$pu_id.
+            patch_dt[species == sp & patch_id %in% cobj$id2patch,
+                     pu_id := cobj$pu_id]
+          }
+        }
+      }
+    }
+  }
+
+  # ---------------------------
+  # 8) Drop sub-viable PUs (again, based on min_patch_size500)
+  # ---------------------------
+  # After all the patch-level changes, re-check every PU’s total area
+  # against the PU-level threshold.
+  pu_agg   <- patch_dt[
+    ,
+    .(pu_area_km2 = sum(patch_area_km2)),
+    by = .(species, pu_id)
+  ]
+  pu_check <- params[pu_agg, on = .(species)]
+  dropped_pu <- pu_check[pu_area_km2 < min_patch_size500,
+                         .(species, pu_id)]
+
+  # Any PU below the threshold is entirely removed:
+  #   - all its patches are enqueued for later cell-level cleanup,
+  #   - CSR entry is removed,
+  #   - patch_dt rows are dropped.
+  if (nrow(dropped_pu) > 0L) {
+    for (i in seq_len(nrow(dropped_pu))) {
+      sp  <- dropped_pu$species[i]
+      pu  <- dropped_pu$pu_id[i]
+      key <- paste0(sp, "|", pu)
+
+      # All patches belonging to this PU get enqueued for later cell-level cleanup.
+      pat_ids <- patch_dt[species == sp & pu_id == pu, patch_id]
+      if (length(pat_ids) > 0L) enqueue_drop(sp, pat_ids)
+
+      # Remove from connectivity and from patch_dt.
+      state_env[[key]] <- NULL
+      patch_dt <- patch_dt[!(species == sp & pu_id == pu)]
+    }
+  }
+
+  # ---------------------------
+  # 9) Apply all pending patch drops to count_alive
+  #     (scan alive cells, use per-species cache)
+  # ---------------------------
+  # Only need to scan cells that are still alive (count_alive > 0).
+  alive_now <- which(count_alive > 0L)
+
+  if (length(alive_now) > 0L) {
+    for (sp in names(pending_drop)) {
+      drop_ids <- pending_drop[[sp]]
+      if (length(drop_ids) > 0L) {
+        # For cells that are still alive, check which have patch IDs in drop_ids
+        # for this species.
+        v_alive <- get_vals_sp(sp)[alive_now]
+        ok      <- !is.na(v_alive)
+
+        if (any(ok)) {
+          # match_alive > 0 indicates cells whose patch_id is in drop_ids.
+          match_alive <- fastmatch::fmatch(v_alive[ok], drop_ids)
+          hit         <- alive_now[ok][which(match_alive > 0L)]
+
+          # In these cells, this species disappears, so decrement count_alive.
+          if (length(hit) > 0L) {
+            count_alive[hit] <- count_alive[hit] - 1L
+          }
+        }
+      }
+    }
+  }
+
+  # ---------------------------
+  # 10) Final removed indices & changed patches
+  # ---------------------------
+  # Cells that were alive before but now have zero species are "removed".
+  removed_indices <- which(count_before > 0L & count_alive == 0L)
+
+  # Patches whose area changed include:
+  #   - patches that lost area in this step (removed_area_by_patch),
+  #   - patches that were dropped entirely (dropped_patches_all).
+  changed_patch_areas <- unique(
+    rbindlist(
+      list(
+        removed_area_by_patch[, .(species, patch_id)],
+        dropped_patches_all
+      ),
+      use.names = TRUE,
+      fill      = TRUE
+    )
+  )
+
+  list(
+    removed_indices     = removed_indices,
+    edge_cell_count     = edge_cell_count,
+    patch_dt            = patch_dt,
+    state_env           = state_env,
+    count_alive         = count_alive,
+    changed_patch_areas = changed_patch_areas
+  )
+}
+
+# ------------------------------------------------------------
+# Orchestrator for repeated pruning iterations
+#
+# Purpose:
+#   Run 'prune_step_minimal' k times in a row, using:
+#     - the same static patch ID matrix (patch_vals_all),
+#     - cached per-species patch ID vectors for faster lookups.
+#   Accumulate:
+#     - all removed cell indices across iterations,
+#     - all patches whose areas changed at least once.
+#
+# Behavior:
+#   - If in some iteration, the number of candidate edge cells is less
+#     than n_remove, the "frontier" is exhausted and we stop early.
+#
+# Arguments:
+#   k           : integer, number of pruning iterations in this stage.
+#   n_remove    : integer, number of cells to remove per pruning iteration.
+#   patch_dt    : patch table (species, patch_id, pu_id, patch_area_km2).
+#   state_env   : list of PU CSR graphs ("species|pu_id" -> CSR object).
+#   count_alive : per-cell alive-species counts.
+#   patch_stack : SpatRaster, one layer per species with patch IDs.
+#   cs_vals     : numeric vector of cell areas (km^2).
+#   rook_pairs_all : integer matrix of rook-adjacent cell indices.
+#   params      : species parameters.
+#   output_dir  : optional folder where per-iteration pruning masks are written.
+#   stage_iter  : optional global stage index for nicer filenames.
+#
+# Returns:
+#   list with:
+#     - patch_dt            : updated patch table.
+#     - state_env           : updated CSR connectivity.
+#     - count_alive         : updated per-cell alive counts.
+#     - removed_indices     : union of all cells removed across iterations.
+#     - changed_patch_areas : union of all patches whose area changed.
+#     - frontier_exhausted  : TRUE if edge frontier was exhausted at some iteration.
+# ------------------------------------------------------------
+run_pruning_orchestrator <- function(
+  k,
+  n_remove,
+  patch_dt,
+  state_env,
+  count_alive,
+  patch_stack,
+  cs_vals,
+  rook_pairs_all,
+  params,
+  output_dir = NULL,   # optional: folder where per-iteration pruning masks are written
+  stage_iter = NULL    # optional: global stage index (for nicer filenames)
+) {
+  # ------------------------------------------------------------------
+  # Precompute patch ID matrix for all species once for this run.
+  # patch_vals_all is constant across pruning iterations because
+  # patch_stack does not change inside this function.
+  #   rows = cells, columns = species layers.
+  # ------------------------------------------------------------------
+  patch_vals_all <- values(patch_stack, mat = TRUE)
+  colnames(patch_vals_all) <- names(patch_stack)
+
+  # Names of the species layers (one layer per species).
+  species_layers <- colnames(patch_vals_all)
+
+  # Map species name -> column index in patch_vals_all.
+  sp_col <- setNames(seq_along(species_layers), species_layers)
+
+  # Per-species PU area thresholds (min_patch_size500), as a named vector.
+  thr_pu_vec <- setNames(params$min_patch_size500, params$species)
+
+  # Cache each species’ patch ID vector so we don’t have to slice
+  # patch_vals_all repeatedly inside prune_step_minimal.
+  vals_cache <- lapply(seq_along(species_layers), function(j) patch_vals_all[, j])
+  names(vals_cache) <- species_layers
+
+  # Will collect *all* cells removed over all k pruning iterations.
+  removed_indices_all <- integer()
+
+  # Will collect all patches whose area changed at least once.
+  changed_patch_areas_all <- data.table(
+    species  = character(),
+    patch_id = integer()
+  )
+
+  # Flag that becomes TRUE if, at some iteration, there are fewer edge cells
+  # than n_remove (i.e., the "edge frontier" is exhausted).
+  frontier_exhausted <- FALSE
+
+  # ------------------------------------------------------------------
+  # Main loop: run up to k pruning iterations, updating the shared state
+  # (patch_dt, state_env, count_alive) each time.
+  # ------------------------------------------------------------------
+  for (iter in seq_len(k)) {
+    # Run one pruning step:
+    #   - identifies edge cells,
+    #   - scores them and selects up to n_remove cells to drop,
+    #   - updates patch areas, drops sub-viable patches/PUs, and updates CSR.
+    step_out <- prune_step_minimal(
+      n_remove       = n_remove,
+      patch_dt       = patch_dt,
+      state_env      = state_env,
+      count_alive    = count_alive,
+      patch_vals_all = patch_vals_all,
+      cs_vals        = cs_vals,
+      rook_pairs_all = rook_pairs_all,
+      params         = params,
+      species_layers = species_layers,
+      sp_col         = sp_col,
+      thr_pu_vec     = thr_pu_vec,
+      vals_cache     = vals_cache
+    )
+
+    # --------------------------------------------------------------
+    # OPTIONAL OUTPUT: write a mask for cells removed in *this* iteration.
+    # Each mask is a raster with value 1 where cells were removed and NA elsewhere.
+    # --------------------------------------------------------------
+    if (!is.null(output_dir) && length(step_out$removed_indices) > 0L) {
+      # Use the first layer of patch_stack as a geometry template.
+      mask <- terra::setValues(patch_stack[[1]], NA_integer_)
+
+      # Mark cells removed in this pruning iteration with value 1.
+      mask[step_out$removed_indices] <- 1L
+
+      # Build a filename; if we know the global stage index, include it.
+      if (!is.null(stage_iter)) {
+        # Example: removed_mask_pruning_stage_0003_iter_002.tif
+        fn <- file.path(
+          output_dir,
+          sprintf(
+            "removed_mask_pruning_stage_%04d_iter_%03d.tif",
+            as.integer(stage_iter),
+            as.integer(iter)
+          )
+        )
+      } else {
+        # Example: removed_mask_pruning_iter_002.tif
+        fn <- file.path(
+          output_dir,
+          sprintf(
+            "removed_mask_pruning_iter_%03d.tif",
+            as.integer(iter)
+          )
+        )
+      }
+
+      # Write the per-iteration mask to disk.
+      terra::writeRaster(mask, filename = fn, overwrite = TRUE)
+    }
+
+    # --------------------------------------------------------------
+    # Update the shared state using the results from this iteration.
+    # --------------------------------------------------------------
+    patch_dt    <- step_out$patch_dt
+    state_env   <- step_out$state_env
+    count_alive <- step_out$count_alive
+
+    # Append removed cell indices to the global list.
+    removed_indices_all <- c(removed_indices_all, step_out$removed_indices)
+
+    # Merge in patches whose area was changed in this iteration,
+    # ensuring we only keep unique (species, patch_id) pairs.
+    if (nrow(step_out$changed_patch_areas)) {
+      changed_patch_areas_all <- unique(
+        rbindlist(
+          list(changed_patch_areas_all, step_out$changed_patch_areas),
+          use.names = TRUE,
+          fill      = TRUE
+        )
+      )
+    }
+
+    # If there were fewer edge cells than n_remove, it means we have
+    # exhausted the frontier of removable edge cells; no point in
+    # continuing further iterations in this pruning stage.
+    if (step_out$edge_cell_count < n_remove) {
+      frontier_exhausted <- TRUE
+      break
+    }
+  }
+
+  # Deduplicate the list of removed indices across all iterations,
+  # in case a cell might somehow be reported multiple times.
+  removed_indices_all <- unique(removed_indices_all)
+
+  # Return the updated state and bookkeeping information needed downstream.
+  list(
+    patch_dt            = patch_dt,                # updated patch table
+    state_env           = state_env,               # updated CSR connectivity
+    count_alive         = count_alive,             # updated per-cell alive counts
+    removed_indices     = removed_indices_all,     # all cells removed in pruning
+    changed_patch_areas = changed_patch_areas_all, # patches whose area changed
+    frontier_exhausted  = frontier_exhausted       # TRUE if no more edge frontier
+  )
+}
+```
+
+# Fragmentation check
+
+```{r}
+# ------------------------------------------------------------
+# 4. Fragmentation Update
+# ------------------------------------------------------------
+# This function:
+#   1) Starts from a post-pruning state:
+#        - patch_stack: per-species patch ID rasters
+#        - patch_dt: per-patch attributes (species, patch_id, pu_id, area)
+#        - state_env: per-PU connectivity graphs (CSR)
+#        - count_alive: per-cell count of species present
+#        - alive01: binary mask of alive cells (1/NA)
+#   2) Looks at patches whose areas changed during pruning.
+#   3) For those patches, re-clumps them into contiguous fragments based on the
+#      current alive geometry.
+#   4) Drops fragments that are too small (below per-species min_patch_size).
+#   5) Creates new patch IDs for surviving fragments, updates patch_dt, and
+#      keeps track of which PUs might now fail their PU-level area thresholds.
+#   6) Rebuilds the per-PU CSR graphs (state_env) to reflect splits and deletions.
+#   7) Rebuilds patch_stack and alive01, and flags patches for distance re-check.
+apply_patch_fragmentation_updates <- function(
+  patch_stack,         # SpatRaster AFTER pruning (patch IDs per species)
+  patch_dt,            # data.table: species, patch_id, pu_id, patch_area_km2
+  state_env,           # named list of CSR objects per PU ("species|pu_id")
+  changed_patch_areas, # data.table / data.frame: species, patch_id
+  cs_vals,             # numeric: per-cell area (km^2), aligned to global cell index
+  params,              # data.table keyed by species, with min_patch_size, min_patch_size500
+  count_alive,         # integer vector: per-cell alive-species count (after pruning)
+  alive01              # SpatRaster: alive mask (1/NA) after pruning
+) {
+  # Names of the per-species layers in the patch raster stack.
+  species_layers <- names(patch_stack)
+
+  # Ensure patch_dt is keyed by (species, patch_id) for fast joins/lookups.
+  data.table::setkey(patch_dt, species, patch_id)
+
+  # Keep a copy of the pre-fragmentation alive-species counts per cell.
+  #   - count_before: immutable snapshot
+  #   - count_work:   mutable vector we update as species disappear from cells
+  count_before <- as.integer(count_alive)
+  count_work   <- as.integer(count_alive)
+
+  # Convert the alive01 raster to a logical vector marking which cells
+  # are still in the "alive" geometry (any species present after pruning).
+  alive_vals <- terra::values(alive01)
+  if (is.matrix(alive_vals)) alive_vals <- alive_vals[, 1]
+  alive_flag <- !is.na(alive_vals) & alive_vals > 0
+
+  # Keep only species + patch_id columns for patches whose areas changed.
+  # These are the patches that need to be re-clumped and possibly split/removed.
+  cand_dt <- data.table::as.data.table(changed_patch_areas)[, .(species, patch_id)]
+
+  # For each species we will store:
+  #   - patches_to_drop : patch IDs that should be removed from patch_dt
+  #   - new_patch_rows  : patch_dt rows for newly created fragments
+  #   - desc_rows       : mapping from old_patch_id -> new_patch_id(s), per PU
+  #   - removed_only    : patches that were completely removed (no descendants)
+  #   - recheck_ids     : patch IDs that need distance-based re-check later
+  #   - layer_sp_final  : updated SpatRaster layer for this species
+  species_updates <- vector("list", length(species_layers))
+  names(species_updates) <- species_layers
+
+  # PUs that should be re-checked against PU-level thresholds
+  # because they lost whole patches or fragments.
+  pu_threshold_check <- data.table::data.table(
+    species = character(),
+    pu_id   = integer()
+  )
+
+  # Accumulated updated areas for patches (old or new IDs).
+  # We build this up incrementally and then apply updates in a single data.table join.
+  area_updates <- data.table::data.table(
+    species        = character(),
+    patch_id       = integer(),
+    patch_area_km2 = numeric()
+  )
+
+  # ------------------------------------------------------------
+  # PASS 1: Fragment each changed patch (per species)
+  # ------------------------------------------------------------
+  for (sp in species_layers) {
+    # Extract the raster layer for this species.
+    lyr0  <- patch_stack[[sp]]
+
+    # Extract cell-wise patch IDs as a numeric vector (one value per cell).
+    vals0 <- terra::values(lyr0, mat = TRUE)[, 1]
+
+    # Restrict patch IDs to cells that remain in the alive geometry.
+    # Cells where alive_flag == FALSE are outside the current alive footprint.
+    vals0[!alive_flag] <- NA_integer_
+
+    # Create a raster layer that respects the alive geometry.
+    lyr0_alive <- terra::setValues(lyr0, vals0)
+
+    # Candidate patch IDs for this species (those that had area changes).
+    cand_ids <- cand_dt[species == sp, unique(patch_id)]
+
+    # If nothing changed for this species, we just carry its layer forward
+    # and record empty updates.
+    if (!length(cand_ids)) {
+      species_updates[[sp]] <- list(
+        patches_to_drop = integer(0),
+        new_patch_rows  = NULL,
+        desc_rows       = NULL,
+        removed_only    = NULL,
+        recheck_ids     = integer(0),
+        layer_sp_final  = lyr0_alive
+      )
+      next
+    }
+
+    # Map each candidate patch ID -> the global cell indices where it occurs
+    # (restricted to the alive geometry).
+    idx_all <- which(!is.na(vals0) & vals0 %in% cand_ids)
+
+    # pid_idx is a list: names(pid_idx) are patch IDs; each element is a vector
+    # of global cell indices where that patch occurs (alive cells only).
+    pid_idx <- if (length(idx_all) > 0L) {
+      split(idx_all, vals0[idx_all], drop = TRUE)
+    } else {
+      list()
+    }
+
+    # vals_new will hold the updated patch IDs after splitting/dropping.
+    # Start from vals0 (patch IDs constrained to alive geometry) and modify.
+    vals_new         <- vals0
+    new_rows_buf     <- list()  # buffer for new patch_dt rows (new fragments)
+    desc_buf         <- list()  # buffer for mapping old_patch_id -> new_patch_id(s)
+    removed_only_buf <- list()  # buffer for patches that were removed entirely
+    drop_lookup_ids  <- integer(0)  # patch IDs to remove from patch_dt for this species
+    recheck_ids      <- integer(0)  # patch IDs that need distance-based re-check later
+
+    # The next free patch_id for this species (for creating new fragments).
+    max_pid  <- max(patch_dt[species == sp, patch_id], na.rm = TRUE)
+
+    # Per-species minimum patch size threshold (km^2).
+    # Fragments smaller than this will be dropped.
+    th_patch <- params[sp, min_patch_size][[1L]]
+
+    # --------------------------------------------------------
+    # Precompute clumps within a cropped extent for speed
+    # --------------------------------------------------------
+    # For all candidate patches of this species, we:
+    #   1) Collect the union of all their cells (all_cells).
+    #   2) Crop the species layer to the minimal bounding box covering all_cells.
+    #   3) Run clumping on this cropped raster.
+    #   4) Build a helper function clump_fetch(pid_cells) that returns the clump
+    #      IDs (within the cropped raster) for the given global cell indices.
+    all_cells <- unlist(pid_idx, use.names = FALSE)
+
+    if (length(all_cells) > 0L) {
+      # Compute a tight extent around all candidate cells.
+      ext_sub <- terra::ext(lyr0_alive, cells = all_cells)
+
+      # Crop the species layer to this bounding box to avoid clumping the full raster.
+      lyr_sub <- terra::crop(lyr0_alive, ext_sub, snap = "near")
+
+      # Compute contiguous clumps (4-neighbour connectivity) within the cropped extent.
+      #   - fasterRaster::fast() converts to a suitable format.
+      #   - fasterRaster::clump(..., diagonal = FALSE) identifies 4-neighbour clumps.
+      #   - terra::rast() wraps the result back into a SpatRaster.
+      cl_sub <- terra::rast(
+        fasterRaster::clump(fasterRaster::fast(lyr_sub), diagonal = FALSE)
+      )
+
+      # Extract clump IDs per cell in the cropped raster.
+      cl_sub_vals <- terra::values(cl_sub, mat = TRUE)[, 1]
+
+      # Map global cell indices (in lyr0_alive) to local cell indices in cl_sub.
+      #   1) Get XY coordinates for global cell indices "all_cells".
+      #   2) Use cellFromXY on cl_sub to find the corresponding local indices.
+      xy_all        <- terra::xyFromCell(lyr0_alive, all_cells)
+      sub_cells_all <- terra::cellFromXY(cl_sub, xy_all)
+      # Name this vector so we can access by global cell index as character.
+      names(sub_cells_all) <- as.character(all_cells)
+
+      # Helper: for a vector of global cell indices (pid_cells), return the clump
+      # IDs those cells belong to, extracted from the cropped clump raster.
+      clump_fetch <- function(pid_cells) {
+        if (!length(pid_cells)) return(integer(0L))
+        cl_sub_vals[sub_cells_all[as.character(pid_cells)]]
+      }
+    } else {
+      # If there are no candidate cells (all_cells is empty), then each candidate
+      # patch is effectively absent from the alive geometry, and clump IDs are moot.
+      # We provide a dummy clump_fetch that returns an empty integer vector.
+      clump_fetch <- function(pid_cells) integer(0L)
+    }
+
+    # ---------------------------
+    # Process each candidate patch of this species
+    # ---------------------------
+    for (pid in cand_ids) {
+      # Look up the PU ID and current area for this patch in patch_dt.
+      # If the patch no longer exists in patch_dt, row_info will be empty.
+      row_info  <- patch_dt[.(sp, pid), .(pu_id, patch_area_km2), nomatch = 0L][1]
+      pu_id_old <- row_info$pu_id
+
+      # Global cell indices for this patch (within the alive geometry).
+      pid_cells <- pid_idx[[as.character(pid)]]
+
+      # If there are no alive cells for this patch (or pid_cells is NULL),
+      # the patch is already extinct in the spatial layer and should be dropped.
+      if (is.null(pid_cells) || !length(pid_cells)) {
+        if (!is.na(pu_id_old)) {
+          # Record that this patch was completely removed (no surviving fragments),
+          # so we can later rebuild CSR and possibly check PU thresholds.
+          removed_only_buf[[length(removed_only_buf) + 1L]] <-
+            data.table::data.table(
+              pu_id        = pu_id_old,
+              old_patch_id = as.integer(pid)
+            )
+        }
+        # Mark this patch ID for removal from patch_dt.
+        drop_lookup_ids <- c(drop_lookup_ids, pid)
+        next
+      }
+
+      # Compute clump IDs (within the cropped clump raster) for all cells of this patch.
+      subc  <- clump_fetch(pid_cells)
+
+      # Unique clump IDs (excluding NA) that this patch occupies.
+      ucomp <- unique(subc[!is.na(subc)])
+
+      # --------------------------------------------------------
+      # Case 1: patch is one contiguous clump (or no clump info)
+      #         -> only area changes; no fragmentation into sub-patches.
+      # --------------------------------------------------------
+      if (length(ucomp) <= 1L) {
+        # Recompute the current area of this patch from its cells.
+        area_now <- sum(cs_vals[pid_cells], na.rm = TRUE)
+
+        # If the total area is below the species-specific patch threshold,
+        # drop the patch entirely.
+        if (area_now < th_patch) {
+          # Schedule patch_dt removal.
+          drop_lookup_ids <- c(drop_lookup_ids, pid)
+
+          # Decrease alive-species count in cells that lose this species.
+          hit <- pid_cells[count_work[pid_cells] > 0L]
+          if (length(hit)) {
+            count_work[hit] <- count_work[hit] - 1L
+          }
+
+          # Remove the patch ID from this species' raster layer.
+          vals_new[pid_cells] <- NA_integer_
+
+          # Record that this PU lost a whole patch, so its PU area
+          # should be checked against the PU-level threshold.
+          if (!is.na(pu_id_old)) {
+            removed_only_buf[[length(removed_only_buf) + 1L]] <-
+              data.table::data.table(
+                pu_id        = pu_id_old,
+                old_patch_id = as.integer(pid)
+              )
+            pu_threshold_check <- rbind(
+              pu_threshold_check,
+              data.table::data.table(species = sp, pu_id = pu_id_old)
+            )
+          }
+        } else {
+          # Patch still above threshold:
+          #   - update its area in area_updates,
+          #   - flag it for distance-based connectivity re-check later.
+          area_updates <- rbind(
+            area_updates,
+            data.table::data.table(
+              species        = sp,
+              patch_id       = as.integer(pid),
+              patch_area_km2 = as.numeric(area_now)
+            )
+          )
+          recheck_ids <- unique(c(recheck_ids, as.integer(pid)))
+        }
+        next
+      }
+
+      # --------------------------------------------------------
+      # Case 2: patch has fragmented into multiple clumps
+      #         -> we treat each clump as a potential new fragment.
+      # --------------------------------------------------------
+
+      # Compute area per clump for this patch:
+      #  - First restrict to non-NA clump IDs.
+      ok <- !is.na(subc)
+      #  - rowsum returns a matrix with one row per clump ID, summing areas.
+      area_tab <- rowsum(
+        cs_vals[pid_cells][ok],
+        subc[ok],
+        reorder = FALSE
+      )
+
+      # keep_tab: one row per clump with:
+      #   comp_raw = raw clump ID,
+      #   area     = area of this clump.
+      keep_tab <- data.frame(
+        comp_raw  = as.integer(rownames(area_tab)),
+        area      = as.numeric(area_tab[, 1]),
+        row.names = NULL
+      )
+
+      # Sort clumps by decreasing area so the largest comes first.
+      keep_tab <- keep_tab[order(-keep_tab$area), , drop = FALSE]
+
+      # Filter clumps to those with area >= patch threshold.
+      keep_tab <- keep_tab[keep_tab$area >= th_patch, , drop = FALSE]
+
+      # Clear the original patch ID from all its cells.
+      # Surviving fragments will get new IDs assigned below.
+      vals_new[pid_cells] <- NA_integer_
+
+      # If no fragment is large enough, drop the entire patch.
+      if (!nrow(keep_tab)) {
+        # Schedule patch_dt removal.
+        drop_lookup_ids <- c(drop_lookup_ids, pid)
+
+        if (!is.na(pu_id_old)) {
+          # Record that this patch was completely removed (no surviving fragments).
+          removed_only_buf[[length(removed_only_buf) + 1L]] <-
+            data.table::data.table(
+              pu_id        = pu_id_old,
+              old_patch_id = as.integer(pid)
+            )
+          # PUs losing an entire patch must be checked against PU-level thresholds.
+          pu_threshold_check <- rbind(
+            pu_threshold_check,
+            data.table::data.table(species = sp, pu_id = pu_id_old)
+          )
+        }
+
+        # Remove this species from all cells of the original patch.
+        hit <- pid_cells[count_work[pid_cells] > 0L]
+        if (length(hit)) {
+          count_work[hit] <- count_work[hit] - 1L
+        }
+        next
+      }
+
+      # Separate clumps into those we keep vs those we drop.
+      keep_ids_raw <- keep_tab$comp_raw
+      drop_ids_raw <- setdiff(ucomp, keep_ids_raw)
+
+      # Cells in dropped fragments lose this species.
+      if (length(drop_ids_raw)) {
+        drop_cells <- pid_cells[subc %in% drop_ids_raw]
+        if (length(drop_cells)) {
+          hit <- drop_cells[count_work[drop_cells] > 0L]
+          if (length(hit)) {
+            count_work[hit] <- count_work[hit] - 1L
+          }
+          # PU threshold may need re-checking as its total area can decrease.
+          if (!is.na(pu_id_old)) {
+            pu_threshold_check <- rbind(
+              pu_threshold_check,
+              data.table::data.table(species = sp, pu_id = pu_id_old)
+            )
+          }
+        }
+      }
+
+      # Assign patch IDs to surviving fragments:
+      #   - the largest fragment keeps the original patch ID,
+      #   - all other fragments get newly created patch IDs (max_pid + 1, 2, ...).
+      if (nrow(keep_tab) > 1L) {
+        new_ids <- c(pid, seq(max_pid + 1L, length.out = nrow(keep_tab) - 1L))
+        max_pid <- max_pid + (length(new_ids) - 1L)
+      } else {
+        new_ids <- pid
+      }
+
+      # Map raw clump IDs (comp_raw) -> their assigned new patch IDs.
+      comp_to_new <- setNames(as.integer(new_ids), as.character(keep_tab$comp_raw))
+
+      # Only cells belonging to kept clump IDs get new patch IDs.
+      keep_mask <- subc %in% keep_tab$comp_raw
+
+      # Write new patch IDs into vals_new for surviving fragments.
+      vals_new[pid_cells[keep_mask]] <-
+        unname(comp_to_new[as.character(subc[keep_mask])])
+
+      # Record updated areas for all surviving fragments.
+      area_updates <- rbind(
+        area_updates,
+        data.table::data.table(
+          species        = sp,
+          patch_id       = as.integer(new_ids),
+          patch_area_km2 = as.numeric(keep_tab$area)
+        )
+      )
+
+      # For extra fragments (beyond the largest), create new patch_dt rows that
+      # inherit the same PU ID as the original patch.
+      if (!is.na(pu_id_old) && length(new_ids) >= 2L) {
+        new_rows_buf[[length(new_rows_buf) + 1L]] <-
+          data.table::data.table(
+            species        = sp,
+            patch_id       = as.integer(new_ids[-1]),
+            pu_id          = pu_id_old,
+            patch_area_km2 = as.numeric(keep_tab$area[-1])
+          )
+      }
+
+      # Record descendant mapping from old_patch_id -> new_patch_id(s),
+      # which will be used later to rebuild PU-level CSR graphs.
+      if (!is.na(pu_id_old)) {
+        desc_buf[[length(desc_buf) + 1L]] <-
+          data.table::data.table(
+            pu_id        = pu_id_old,
+            old_patch_id = as.integer(pid),
+            new_patch_id = as.integer(new_ids)
+          )
+      }
+
+      # All surviving fragments need distance-based connectivity checks later.
+      recheck_ids <- unique(c(recheck_ids, as.integer(new_ids)))
+    } # end loop over candidate patches for this species
+
+    # Convert buffered lists into data.tables for this species.
+    new_patch_rows <- if (length(new_rows_buf)) {
+      data.table::rbindlist(new_rows_buf, use.names = TRUE)
+    } else {
+      NULL
+    }
+
+    desc_rows <- if (length(desc_buf)) {
+      data.table::rbindlist(desc_buf, use.names = TRUE)
+    } else {
+      NULL
+    }
+
+    removed_only <- if (length(removed_only_buf)) {
+      data.table::rbindlist(removed_only_buf, use.names = TRUE)
+    } else {
+      NULL
+    }
+
+    # Store all per-species updates, including the final raster layer.
+    species_updates[[sp]] <- list(
+      patches_to_drop = unique(as.integer(drop_lookup_ids)),
+      new_patch_rows  = new_patch_rows,
+      desc_rows       = desc_rows,
+      removed_only    = removed_only,
+      recheck_ids     = unique(as.integer(recheck_ids)),
+      layer_sp_final  = terra::setValues(lyr0_alive, vals_new)
+    )
+  } # end loop over species
+
+  # ------------------------------------------------------------
+  # PASS 2: Update patch_dt (drop patches, update areas, add fragments)
+  # ------------------------------------------------------------
+
+  # Remove patches that were dropped entirely in PASS 1 for each species.
+  for (sp in names(species_updates)) {
+    rid <- species_updates[[sp]]$patches_to_drop
+    if (length(rid)) {
+      patch_dt <- patch_dt[!(species == sp & patch_id %in% rid)]
+    }
+  }
+
+  # Apply updated areas to all surviving patches (old and new IDs).
+  # area_updates may include multiple rows per (species, patch_id); the last
+  # assignment wins because of data.table semantics.
+  if (nrow(area_updates)) {
+    patch_dt[area_updates,
+             patch_area_km2 := i.patch_area_km2,
+             on = .(species, patch_id)]
+  }
+
+  # Append new patch_dt rows for newly created fragments, across all species.
+  new_rows_all <- data.table::rbindlist(
+    lapply(species_updates, `[[`, "new_patch_rows"),
+    use.names = TRUE,
+    fill = TRUE
+  )
+
+  if (nrow(new_rows_all)) {
+    patch_dt <- data.table::rbindlist(
+      list(patch_dt, unique(new_rows_all)),
+      use.names = TRUE,
+      fill = TRUE
+    )
+  }
+
+  # ------------------------------------------------------------
+  # PASS 2b: PU threshold checks (min_patch_size500)
+  # ------------------------------------------------------------
+  # Some PUs may now have total area below the PU-level threshold because
+  # they lost whole patches or fragments. Those PUs (and all their patches)
+  # are removed, and count_work is decremented in the corresponding cells.
+  if (nrow(pu_threshold_check)) {
+    pu_threshold_check <- unique(pu_threshold_check)
+    data.table::setkey(pu_threshold_check, species, pu_id)
+
+    # Process each species independently.
+    for (sp in unique(pu_threshold_check$species)) {
+      # PU-level area threshold for this species (minimum PU size).
+      thr_pu    <- params[sp, min_patch_size500][[1L]]
+      # PUs of this species that have been flagged as needing threshold checks.
+      pu_ids_sp <- pu_threshold_check[species == sp, unique(pu_id)]
+
+      # Current total areas for these candidate PUs.
+      pu_rows_now <- patch_dt[
+        species == sp & pu_id %in% pu_ids_sp,
+        .(pu_area_km2 = sum(patch_area_km2)),
+        by = .(species, pu_id)
+      ]
+
+      # PUs whose total area is below the PU threshold.
+      to_drop <- pu_rows_now[pu_area_km2 < thr_pu, .(species, pu_id)]
+
+      if (nrow(to_drop)) {
+        # Get the updated species raster values once for this species.
+        vals_sp_final <- terra::values(species_updates[[sp]]$layer_sp_final, mat = TRUE)[, 1]
+
+        # For each PU that fails the threshold:
+        for (j in seq_len(nrow(to_drop))) {
+          pu <- to_drop$pu_id[j]
+
+          # All patch IDs belonging to this PU.
+          patch_ids <- patch_dt[species == sp & pu_id == pu, patch_id]
+
+          if (length(patch_ids)) {
+            # Cells whose patch IDs are in this PU lose this species.
+            idx <- which(!is.na(vals_sp_final) & vals_sp_final %in% patch_ids)
+            if (length(idx)) {
+              hit <- idx[count_work[idx] > 0L]
+              if (length(hit)) {
+                count_work[hit] <- count_work[hit] - 1L
+              }
+            }
+          }
+
+          # Drop all patches of this PU from patch_dt and remove its CSR entry.
+          patch_dt <- patch_dt[!(species == sp & pu_id == pu)]
+          key <- paste0(sp, "|", pu)
+          state_env[[key]] <- NULL
+        }
+      }
+    }
+  }
+
+  # ------------------------------------------------------------
+  # PASS 3: Rebuild CSR for affected PUs (descendants + deletions)
+  # ------------------------------------------------------------
+  # Using the descendant mapping and "removed_only" information from PASS 1,
+  # we rebuild the PU-level graphs (state_env_refined) so that connectivity
+  # is consistent with the new patch IDs and removed patches.
+  state_env_refined <- state_env
+
+  for (sp in names(species_updates)) {
+    su <- species_updates[[sp]]
+
+    # PUs affected by fragment splits or complete patch removals for this species.
+    pu_ids <- unique(c(
+      if (!is.null(su$desc_rows))    su$desc_rows$pu_id    else integer(0),
+      if (!is.null(su$removed_only)) su$removed_only$pu_id else integer(0)
+    ))
+    pu_ids <- pu_ids[!is.na(pu_ids)]
+    if (!length(pu_ids)) next
+
+    for (pu in pu_ids) {
+      key      <- paste0(sp, "|", pu)
+      conn_old <- state_env_refined[[key]]
+      if (is.null(conn_old)) next
+
+      id2patch_old <- as.integer(conn_old$id2patch)  # old node -> patch ID
+      row_ptr_old  <- as.integer(conn_old$row_ptr)   # old CSR row pointer
+      col_idx_old  <- as.integer(conn_old$col_idx)   # old CSR column indices
+
+      # Current patches (and their areas) that belong to this PU (post-fragmentation).
+      pu_rows_now  <- patch_dt[.(sp, pu), on = .(species, pu_id)][!is.na(patch_id)]
+      pu_patch_now <- unique(pu_rows_now$patch_id)
+
+      # If the PU lost all patches, drop its CSR entry entirely.
+      if (!length(pu_patch_now)) {
+        state_env_refined[[key]] <- NULL
+        next
+      }
+
+      # Patches that existed in the old CSR but no longer belong to this PU.
+      removed_ids <- setdiff(id2patch_old, pu_patch_now)
+
+      # TRUE if this PU now contains patch IDs that were not in id2patch_old,
+      # i.e., new IDs from patch splitting.
+      has_new_ids <- any(!(pu_patch_now %in% id2patch_old))
+
+      # --------------------------------------------------------
+      # Cheap path: only deletions or area changes, no new patch IDs
+      # --------------------------------------------------------
+      if (!has_new_ids) {
+        if (!length(removed_ids)) {
+          # Only patch areas changed: CSR structure unchanged.
+          # We just update patch_area and comp_area.
+          areas_map      <- pu_rows_now[, .(patch_id, patch_area_km2)]
+          patch_area_vec <- areas_map$patch_area_km2[
+            match(id2patch_old, areas_map$patch_id)
+          ]
+
+          # Update fields in place.
+          state_env_refined[[key]]$patch_area <- patch_area_vec
+          state_env_refined[[key]]$comp_area  <- sum(patch_area_vec, na.rm = TRUE)
+          next
+        } else {
+          # Some patches were deleted, but no new IDs were introduced.
+          # Use .rebuild_csr() to restrict the CSR to surviving nodes only.
+          keep_idx <- which(!(id2patch_old %in% removed_ids))
+          if (!length(keep_idx)) {
+            # No nodes remain in this PU; drop CSR entry entirely.
+            state_env_refined[[key]] <- NULL
+            next
+          }
+
+          # Restrict CSR to surviving nodes.
+          newg         <- .rebuild_csr(row_ptr_old, col_idx_old, keep_idx)
+          id2patch_new <- as.integer(id2patch_old[keep_idx])
+
+          # Map surviving patch IDs to their current areas.
+          areas_map      <- pu_rows_now[, .(patch_id, patch_area_km2)]
+          patch_area_vec <- areas_map$patch_area_km2[
+            match(id2patch_new, areas_map$patch_id)
+          ]
+
+          # Rebuild the CSR object for this PU.
+          state_env_refined[[key]] <- list(
+            species    = sp,
+            pu_id      = pu,
+            id2patch   = id2patch_new,
+            patch2id   = as.integer(seq_along(id2patch_new)),
+            row_ptr    = newg$row_ptr,
+            col_idx    = newg$col_idx,
+            alive      = rep(TRUE, length(id2patch_new)),
+            patch_area = patch_area_vec,
+            comp_id    = rep(1L, length(id2patch_new)),
+            comp_area  = sum(patch_area_vec, na.rm = TRUE)
+          )
+          next
+        }
+      }
+
+      # --------------------------------------------------------
+      # Full rebuild: PUs with new patch IDs (splits/merges)
+      # --------------------------------------------------------
+
+      M_old       <- length(id2patch_old)                     # number of old nodes
+      descendants <- setNames(vector("list", M_old),          # map old patch -> descendant IDs
+                              as.character(id2patch_old))
+
+      # Build a mapping from each old patch ID to its surviving descendants.
+      for (pid0 in id2patch_old) {
+        keep_desc <- integer(0)
+
+        if (!is.null(su$desc_rows)) {
+          # Descendants from splitting events: rows in desc_rows where:
+          #   - pu_id == current PU
+          #   - old_patch_id == pid0
+          keep_desc <- unique(as.integer(
+            su$desc_rows$new_patch_id[
+              su$desc_rows$pu_id == pu & su$desc_rows$old_patch_id == pid0
+            ]
+          ))
+        }
+
+        if (length(keep_desc)) {
+          # Old patch split into one or more new patches.
+          descendants[[as.character(pid0)]] <- keep_desc
+        } else if (!is.null(su$removed_only) &&
+                   nrow(su$removed_only[pu_id == pu & old_patch_id == pid0]) > 0L) {
+          # Old patch was completely removed (no descendants).
+          descendants[[as.character(pid0)]] <- integer(0)
+        } else {
+          # Old patch ID survives unchanged if it is still present in pu_patch_now;
+          # otherwise, it has no descendants.
+          descendants[[as.character(pid0)]] <-
+            if (pid0 %in% pu_patch_now) as.integer(pid0) else integer(0)
+        }
+      }
+
+      # --------------------------------------------------------
+      # Inherit edges across descendants:
+      #   For each edge (a, b) in the old graph, with descendants da and db,
+      #   we create all pairwise edges between da and db.
+      # --------------------------------------------------------
+      inh_u_buf <- vector("list", M_old)
+      inh_v_buf <- vector("list", M_old)
+
+      for (ii in seq_len(M_old)) {
+        # Neighbour positions in col_idx_old for node ii.
+        s <- row_ptr_old[ii] + 1L
+        e <- row_ptr_old[ii + 1L]
+        if (e >= s) {
+          # Neighbours in 1..M_old.
+          nbrs <- col_idx_old[s:e]
+
+          # Only look at neighbours v > ii so we only process each undirected edge once.
+          nbrs <- nbrs[nbrs > ii]
+
+          if (length(nbrs)) {
+            a <- id2patch_old[ii]  # old patch ID at node ii
+
+            # For each neighbour node index bi, we:
+            #   - get old patch ID b = id2patch_old[bi]
+            #   - fetch descendants da (for a) and db (for b)
+            #   - create a small edge list between da and db (Cartesian product).
+            pairs <- lapply(nbrs, function(bi) {
+              b  <- id2patch_old[bi]
+              da <- descendants[[as.character(a)]]
+              db <- descendants[[as.character(b)]]
+              if (length(da) && length(db)) {
+                cbind(rep(da, length(db)), rep(db, length(da)))
+              } else NULL
+            })
+
+            # Concatenate non-NULL edge lists for this ii.
+            P <- do.call(rbind, Filter(Negate(is.null), pairs))
+            if (!is.null(P)) {
+              inh_u_buf[[ii]] <- P[, 1]
+              inh_v_buf[[ii]] <- P[, 2]
+            }
+          }
+        }
+      }
+
+      # Flatten inherited edge endpoints across all ii.
+      inh_u <- if (length(Filter(length, inh_u_buf)) > 0L) {
+        unlist(inh_u_buf, use.names = FALSE)
+      } else integer()
+      inh_v <- if (length(Filter(length, inh_v_buf)) > 0L) {
+        unlist(inh_v_buf, use.names = FALSE)
+      } else integer()
+
+      # --------------------------------------------------------
+      # Add edges between sibling fragments:
+      #   If a patch splits into multiple descendants, we connect all
+      #   new IDs that descend from the same parent.
+      # --------------------------------------------------------
+      sib_list <- list()
+      kk <- 0L
+
+      for (d in descendants) {
+        if (length(d) > 1L) {
+          kk <- kk + 1L
+          # utils::combn(d, 2) returns all 2-combinations of descendants.
+          # Transpose so each row is a pair (u, v).
+          sib_list[[kk]] <- t(utils::combn(d, 2L))
+        }
+      }
+
+      # Combine sibling edges into a single matrix if any exist.
+      sib <- if (kk > 0L) do.call(rbind, sib_list) else matrix(integer(0), ncol = 2L)
+
+      # --------------------------------------------------------
+      # Combine inherited edges and sibling edges into a single
+      # undirected edge list (edges_dt).
+      # --------------------------------------------------------
+      edges_dt <- unique(data.table::rbindlist(list(
+        if (length(inh_u))
+          data.table::data.table(
+            u = pmin(inh_u, inh_v),
+            v = pmax(inh_u, inh_v)
+          ) else NULL,
+        if (nrow(sib))
+          data.table::data.table(
+            u = pmin(sib[, 1], sib[, 2]),
+            v = pmax(sib[, 1], sib[, 2])
+          ) else NULL
+      ), use.names = TRUE, fill = TRUE))
+
+      # Final set of patch IDs in this PU, sorted and re-indexed 1..K.
+      patches_final <- sort(unique(as.integer(pu_patch_now)))
+
+      # Mapping from patch ID -> new node index (1..K).
+      map <- setNames(seq_along(patches_final), patches_final)
+
+      if (nrow(edges_dt) > 0L) {
+        # Map patch IDs in edge list to new consecutive indices.
+        u <- unname(map[as.character(edges_dt$u)])
+        v <- unname(map[as.character(edges_dt$v)])
+
+        # Keep only edges where both endpoints are present and not self-loops.
+        keep <- !is.na(u) & !is.na(v) & (u != v)
+        u <- u[keep]
+        v <- v[keep]
+
+        # Symmetrise edges to build an undirected adjacency list:
+        #   for each edge (u, v), we add (u, v) and (v, u).
+        u_all   <- c(u, v)
+        v_all   <- c(v, u)
+
+        # Split by origin node index: adj_new[[i]] = neighbours of node i.
+        adj_new <- split(v_all, u_all)
+      } else {
+        # No edges; adjacency is empty for all nodes.
+        adj_new <- list()
+      }
+
+      # Build adjacency list for each node in this PU (1..length(patches_final)).
+      adj_full <- vector("list", length(patches_final))
+      if (length(adj_new)) {
+        for (nm in names(adj_new)) {
+          adj_full[[as.integer(nm)]] <- sort(unique(adj_new[[nm]]))
+        }
+      }
+
+      # --------------------------------------------------------
+      # Convert adjacency list into CSR representation for this PU.
+      # --------------------------------------------------------
+      lens    <- vapply(adj_full, length, integer(1L))  # degree of each node
+      row_ptr <- c(0L, cumsum(lens))                    # cumulative sum of degrees
+      col_idx <- as.integer(unlist(adj_full, use.names = FALSE))
+      if (!length(col_idx)) col_idx <- integer(0L)
+
+      # Map final patch IDs to their areas, in the same order as patches_final.
+      areas_map      <- pu_rows_now[, .(patch_id, patch_area_km2)]
+      patch_area_vec <- areas_map$patch_area_km2[
+        match(patches_final, areas_map$patch_id)
+      ]
+
+      # Replace the PU's CSR graph with the rebuilt one.
+      state_env_refined[[key]] <- list(
+        species    = sp,
+        pu_id      = pu,
+        id2patch   = as.integer(patches_final),
+        patch2id   = as.integer(seq_along(patches_final)),
+        row_ptr    = as.integer(row_ptr),
+        col_idx    = col_idx,
+        alive      = rep(TRUE, length(patches_final)),
+        patch_area = patch_area_vec,
+        comp_id    = rep(1L, length(patches_final)),
+        comp_area  = sum(patch_area_vec, na.rm = TRUE)
+      )
+    }
+  }
+
+  # ------------------------------------------------------------
+  # PASS 4: Rebuild patch_stack from per-species layers
+  # ------------------------------------------------------------
+  # Combine the updated per-species raster layers into a single SpatRaster stack.
+  layers_final <- lapply(
+    species_layers,
+    function(sp) {
+      x <- species_updates[[sp]]$layer_sp_final
+      names(x) <- sp
+      x
+    }
+  )
+  patch_stack_refined <- terra::rast(layers_final)
+
+  # ------------------------------------------------------------
+  # PASS 5: Build removal mask (indices) & update alive01
+  # ------------------------------------------------------------
+  # Cells whose alive-species count dropped from >0 to 0 are now dead.
+  # We compute "removed_idx" as those cells and mark them as NA in alive01.
+  removed_idx <- which(
+    !is.na(count_before) & count_before > 0L &
+    !is.na(count_work)   & count_work   == 0L
+  )
+
+  # Update alive01 raster to mark newly dead cells.
+  alive01_refined <- alive01
+  if (length(removed_idx)) {
+    alive01_refined[removed_idx] <- NA
+  }
+
+  # ------------------------------------------------------------
+  # PASS 6: Collect patch_ids_to_recheck
+  # ------------------------------------------------------------
+  # Gather all patches that changed geometry or ID and therefore need
+  # distance-based connectivity re-check in the next stage.
+  recheck_all <- data.table::rbindlist(
+    lapply(names(species_updates), function(sp) {
+      ids <- species_updates[[sp]]$recheck_ids
+      if (!length(ids)) return(NULL)
+      data.table::data.table(species = sp, patch_id = as.integer(ids))
+    }),
+    use.names = TRUE,
+    fill = TRUE
+  )
+
+  if (nrow(recheck_all)) {
+    data.table::setkey(recheck_all, species, patch_id)
+    # Keep only patch IDs that still exist in patch_dt (some may have been dropped).
+    recheck_all <- unique(
+      recheck_all[
+        patch_dt[, .(species, patch_id)],
+        on = .(species, patch_id),
+        nomatch = 0L
+      ]
+    )
+  } else {
+    # Create a correctly-typed empty table if there is nothing to recheck.
+    recheck_all <- data.table::data.table(
+      species  = character(),
+      patch_id = integer()
+    )
+  }
+
+  # ------------------------------------------------------------
+  # Final return: updated rasters, tables, graphs, and bookkeeping
+  # ------------------------------------------------------------
+  list(
+    patch_stack          = patch_stack_refined,  # updated patch ID rasters
+    patch_dt             = patch_dt,             # updated patch lookup table
+    state_env            = state_env_refined,    # updated PU CSR connectivity
+    count_alive          = count_work,           # updated per-cell alive-species counts
+    alive01              = alive01_refined,      # updated alive mask
+    patch_ids_to_recheck = recheck_all,          # patches needing distance re-check
+    removed_indices      = removed_idx           # cells that became empty
+  )
+}
+```
+
+# Distance Check
+
+```{r}
+# ------------------------------------------------------------
+# 5. Distance-based Connectivity Update (minimal version)
+# ------------------------------------------------------------
+# What this function does, in plain language:
+#   - Some patches were flagged as "changed" by the fragmentation step.
+#   - Here, we check whether edges between these patches and their neighbours
+#     are actually within the species' dispersal distance.
+#   - If an edge is too long, we delete it from that PU's graph.
+#   - Deleting edges can split a PU into several disconnected components.
+#   - Components whose total PU area is below the species' PU threshold
+#     are removed entirely (patches dropped, cells cleared, counts updated).
+#   - Components that survive become one or more PUs, and the CSR graph
+#     (state_env) is updated using the helper .update_pu_components().
+#   - Finally, we update the alive mask (alive01) and return the updated state.
+update_connectivity_after_distance <- function(
+  patch_stack,          # SpatRaster: patch IDs per species (after fragmentation)
+  patch_dt,             # data.table: species, patch_id, pu_id, patch_area_km2
+  state_env,            # list of CSR graphs per PU (key: "species|pu_id")
+  patch_ids_to_recheck, # data.table: (species, patch_id) that changed shape/ID
+  params,               # data.table: species, dispersal_dist (km), min_patch_size500
+  count_alive,          # integer: per-cell count of how many species are present
+  alive01               # SpatRaster: alive mask (1/NA) after fragmentation
+) {
+  # Use spherical geometry for distance calculations (more accurate on Earth).
+  # This ensures that sf::st_distance uses great-circle distances rather than
+  # treating coordinates as flat Cartesian coordinates.
+  sf::sf_use_s2(TRUE)
+
+  # Ensure patch_dt is keyed by (species, patch_id) so that joins and lookups
+  # like patch_dt[.(sp, pid), ] are fast and use binary search.
+  data.table::setkey(patch_dt, species, patch_id)
+
+  # Snapshot of the per-cell species count before distance-based pruning.
+  #   - count_before: fixed reference for "before".
+  #   - count_work:   mutable vector that we will decrement as species disappear.
+  count_before <- as.integer(count_alive)
+  count_work   <- as.integer(count_alive)
+
+  # Species-specific dispersal distances (km -> m).
+  # disp_m_by_species["sp_name"] gives the maximum allowed edge length (meters)
+  # for that species when checking patch-to-patch distances.
+  disp_m_by_species <- setNames(params$dispersal_dist * 1000, params$species)
+
+  # Species-specific minimum PU areas (km^2).
+  # min_pu_by_species["sp_name"] gives the minimum total area that a connected
+  # component must have to remain as a valid PU after edges are deleted.
+  min_pu_by_species <- setNames(params$min_patch_size500, params$species)
+
+  # Normalise patch_ids_to_recheck to a simple 2-column data.table and key it.
+  # This table marks (species, patch_id) that underwent geometric change and
+  # therefore need distance-based edge checking.
+  recheck_dt <- data.table::as.data.table(patch_ids_to_recheck)[, .(species, patch_id)]
+  data.table::setkey(recheck_dt, species, patch_id)
+
+  # ------------------------------------------------------------------
+  # Cache raster values per species to avoid calling terra::values()
+  # repeatedly. This is purely for performance: each species layer is
+  # read from disk into a vector once and then stored in vals_cache.
+  # ------------------------------------------------------------------
+  vals_cache <- new.env(parent = emptyenv())
+
+  # Helper: retrieve cell-wise patch IDs for species 'sp' from patch_stack.
+  #   - Each call returns an integer vector (length = ncell of patch_stack),
+  #     where each element is the patch_id of species 'sp' at that cell
+  #     (or NA if the cell has no patch for that species).
+  #   - The result is cached in vals_cache so subsequent calls are cheap.
+  get_layer_vals <- function(sp) {
+    key <- paste0("vals__", sp)
+    if (!exists(key, envir = vals_cache, inherits = FALSE)) {
+      # Read values from the corresponding raster layer.
+      v <- terra::values(patch_stack[[sp]])
+      if (is.matrix(v)) v <- v[, 1]          # flatten matrix to vector if needed
+      assign(key, as.integer(v), envir = vals_cache)
+    }
+    get(key, envir = vals_cache, inherits = FALSE)
+  }
+
+  # ------------------------------------------------------------------
+  # Determine which PUs we actually need to examine.
+  # Strategy:
+  #  - recheck_dt tells us which patches (species, patch_id) changed.
+  #  - We join to patch_dt to find which PUs these patches belong to.
+  #  - Only those PUs need distance-based graph updates.
+  # ------------------------------------------------------------------
+  recheck_pus <- merge(
+    recheck_dt,
+    patch_dt[, .(species, patch_id, pu_id)],  # minimal columns needed
+    by    = c("species", "patch_id"),
+    all.x = TRUE
+  )
+  # Remove any rows that did not find a PU (i.e., patch might have been dropped).
+  recheck_pus <- unique(recheck_pus[!is.na(pu_id)])
+
+  # Working copy of CSR graphs; we will mutate this instead of the original.
+  state_env_work <- state_env
+
+  # ------------------------------------------------------------------
+  # Main loop: process each species that has at least one PU to recheck.
+  # For each species:
+  #   - find PUs containing changed patches,
+  #   - build candidate patch polygons (changed patches + neighbours),
+  #   - run distance checks, drop long edges,
+  #   - split PUs and drop sub-threshold components via .update_pu_components().
+  # ------------------------------------------------------------------
+  for (sp in unique(recheck_pus$species)) {
+    # All PUs (for this species) that contain at least one patch in the recheck list.
+    pu_ids_sp <- unique(recheck_pus[species == sp, pu_id])
+
+    # All patch IDs of this species that were flagged for distance-based re-check.
+    changed_ids_sp <- unique(recheck_dt[.(sp), patch_id])
+
+    # If there are no PUs or no changed patches for this species, skip it.
+    if (!length(pu_ids_sp) || !length(changed_ids_sp)) next
+
+    # ----------------------------------------------------------------
+    # Step 1: Collect candidate patch IDs for this species.
+    # We reduce work by only constructing polygons for:
+    #   - changed patches, and
+    #   - their direct neighbours in the PU graphs.
+    #
+    # To do this, we:
+    #   - loop over relevant PUs,
+    #   - from each PU graph, find nodes corresponding to changed patches,
+    #   - also collect all adjacent nodes (their neighbours),
+    #   - union all these patch IDs into cand_patch_ids_sp.
+    # ----------------------------------------------------------------
+    cand_patch_ids_sp <- integer(0L)
+
+    for (pu in pu_ids_sp) {
+      key  <- paste0(sp, "|", pu)
+      conn <- state_env_work[[key]]
+      if (is.null(conn)) next  # PU may have been removed by earlier iterations
+
+      id2patch <- as.integer(conn$id2patch)  # node index -> patch_id
+      row_ptr  <- as.integer(conn$row_ptr)   # CSR row pointers
+      col_idx  <- as.integer(conn$col_idx)   # CSR adjacency indices
+
+      # Identify which nodes (indices in id2patch) correspond to changed patches.
+      # changed_ids_sp ∩ id2patch = patch IDs that are both changed and in this PU.
+      changed_idx <- match(intersect(changed_ids_sp, id2patch), id2patch)
+      changed_idx <- changed_idx[!is.na(changed_idx)]
+      if (!length(changed_idx)) next
+
+      # For each changed node u, extract CSR neighbours (indices of connected nodes).
+      nbr_idx <- unique(unlist(lapply(changed_idx, function(u) {
+        s <- row_ptr[u] + 1L                     # start index in col_idx
+        e <- row_ptr[u + 1L]                     # end index in col_idx
+        if (e >= s) as.integer(col_idx[s:e]) else integer()
+      })))
+
+      # Candidate nodes = changed nodes + their neighbours.
+      cand_nodes        <- sort(unique(c(changed_idx, nbr_idx)))
+      # Translate candidate node indices to patch IDs and accumulate across PUs.
+      cand_patch_ids_sp <- c(cand_patch_ids_sp, id2patch[cand_nodes])
+    }
+
+    # Unique candidate patch IDs for this species across all its rechecked PUs.
+    cand_patch_ids_sp <- sort(unique(cand_patch_ids_sp))
+    if (!length(cand_patch_ids_sp)) next  # nothing to do if no candidates
+
+    # ----------------------------------------------------------------
+    # Step 2: Build polygons for all candidate patches of this species.
+    # We:
+    #   - extract the full cell-wise patch IDs for species 'sp',
+    #   - mask out cells that don't belong to candidate patches,
+    #   - convert those patch IDs to polygons (dissolve contiguous cells),
+    #   - ensure CRS is lon/lat (EPSG:4326),
+    #   - convert to sf and set up geometry/indexing helpers.
+    # ----------------------------------------------------------------
+    # Full patch ID vector (per cell) for this species.
+    lv_full <- get_layer_vals(sp)
+
+    # idx_match > 0 where lv_full is in cand_patch_ids_sp; 0 otherwise.
+    idx_match   <- match(lv_full, cand_patch_ids_sp, nomatch = 0L)
+
+    # masked_vals will hold NA for non-candidate cells and patch IDs for candidates.
+    masked_vals <- rep(NA_integer_, length(lv_full))
+    masked_vals[idx_match > 0L] <- lv_full[idx_match > 0L]
+
+    # Create a raster that only contains candidate patch IDs.
+    masked_rast <- terra::setValues(patch_stack[[sp]], masked_vals)
+
+    # Convert candidate patch IDs into polygons:
+    #   - values = TRUE: include patch_id attribute in the polygon.
+    #   - dissolve = TRUE: cells with the same patch_id that touch are merged.
+    poly <- terra::as.polygons(masked_rast, values = TRUE, dissolve = TRUE)
+
+    # Ensure polygons are in geographic coordinates (lat/lon) for sf::st_distance.
+    if (!terra::is.lonlat(poly)) {
+      poly <- terra::project(poly, "EPSG:4326")
+    }
+
+    # Convert to sf object; the non-geometry column is the patch ID.
+    poly_sf_sp <- sf::st_as_sf(poly)
+    gcol       <- attr(poly_sf_sp, "sf_column")           # name of geometry column
+    pidc       <- setdiff(names(poly_sf_sp), gcol)[1]     # attribute column for patch IDs
+    data.table::setnames(poly_sf_sp, pidc, "patch_id")    # rename attribute to "patch_id"
+
+    # Drop any polygons with NA patch_id (should be rare / impossible).
+    poly_sf_sp <- poly_sf_sp[!is.na(poly_sf_sp$patch_id), ]
+
+    # Map from patch_id -> row index in poly_sf_sp.
+    pid_to_poly_sp <- setNames(seq_len(nrow(poly_sf_sp)), as.character(poly_sf_sp$patch_id))
+
+    # Geometry vector used in distance computations.
+    geom_sp <- sf::st_geometry(poly_sf_sp)
+
+    # Dispersal distance (meters) for this species. Any patch-patch distance
+    # strictly greater than this value will cause that edge to be removed.
+    disp_m <- disp_m_by_species[[sp]]
+
+    # Next available PU ID for this species. When .update_pu_components()
+    # splits PUs, it uses this to assign new PU IDs. We track the global
+    # maximum across species entries in patch_dt.
+    next_pu_id_sp <- max(patch_dt[species == sp, pu_id], na.rm = TRUE)
+    if (!is.finite(next_pu_id_sp)) next_pu_id_sp <- 0L
+
+    # ----------------------------------------------------------------
+    # Step 3: Loop over each PU of this species and apply distance filter
+    #         to edges, then split/drop components via .update_pu_components().
+    # For each PU:
+    #   - rebuild adjacency list from CSR,
+    #   - find edges incident to changed patches,
+    #   - compute distances between polygons for those edges,
+    #   - drop edges exceeding dispersal distance,
+    #   - generate modified CSR and hand to .update_pu_components(),
+    #   - handle dropped components (patch & cell removal),
+    #   - update/replace CSR entries in state_env_work.
+    # ----------------------------------------------------------------
+    for (pu in pu_ids_sp) {
+      key  <- paste0(sp, "|", pu)
+      conn <- state_env_work[[key]]
+      if (is.null(conn)) next  # PU may have been removed earlier
+
+      id2patch <- as.integer(conn$id2patch)  # node index -> patch_id
+      N        <- length(id2patch)          # number of nodes in this PU
+      row_ptr  <- as.integer(conn$row_ptr)  # CSR row pointer (length N+1)
+      col_idx  <- as.integer(conn$col_idx)  # CSR column indices (neighbours)
+
+      # Build adjacency list from CSR.
+      # For each node i (1..N), adj[[i]] is a vector of neighbour node indices.
+      adj <- vector("list", N)
+      for (i in seq_len(N)) {
+        s <- row_ptr[i] + 1L
+        e <- row_ptr[i + 1L]
+        if (e >= s) {
+          adj[[i]] <- as.integer(col_idx[s:e])
+        } else {
+          adj[[i]] <- integer(0L)
+        }
+      }
+
+      # Node indices in this PU whose patch IDs are in changed_ids_sp.
+      changed_ids_pu <- intersect(changed_ids_sp, id2patch)
+      changed_idx    <- match(changed_ids_pu, id2patch)
+      changed_idx    <- changed_idx[!is.na(changed_idx)]
+      if (!length(changed_idx)) next  # no changed patches in this PU
+
+      # ----------------------------------------------------------------
+      # Step 3a: Collect edges incident to changed patches.
+      # We only need to check edges that touch at least one changed node,
+      # because edges between unchanged neighbours are assumed to remain valid.
+      # ----------------------------------------------------------------
+      pairs_i <- integer(0L)  # origin node indices
+      pairs_j <- integer(0L)  # neighbour node indices
+
+      for (u in changed_idx) {
+        nb <- adj[[u]]     # neighbours of node u in the adjacency list
+        if (length(nb)) {
+          pairs_i <- c(pairs_i, rep(u, length(nb)))
+          pairs_j <- c(pairs_j, nb)
+        }
+      }
+
+      if (!length(pairs_i)) next  # no edges touching changed patches
+
+      # Unique list of directed edges (i, j) incident to changed patches.
+      # We keep them as directed for distance evaluation, but later when we
+      # drop edges we remove both i->j and j->i to maintain undirectedness.
+      pairs <- data.table::data.table(i = pairs_i, j = pairs_j)
+      pairs <- unique(pairs)
+
+      # ----------------------------------------------------------------
+      # Step 3b: Distance filter.
+      # For each edge (i, j), we:
+      #   - map i, j to their patch IDs,
+      #   - look up the corresponding polygons,
+      #   - compute the distance between these polygons,
+      #   - mark edge as "keep" if distance <= species dispersal distance.
+      # ----------------------------------------------------------------
+      keep_flag <- logical(nrow(pairs))  # keep_flag[k] = TRUE if edge k is kept
+
+      # Group edges by origin node "i" so we can reuse geometry for patch i
+      # and avoid recomputing distances repeatedly for the same origin.
+      idx_by_i <- split(seq_len(nrow(pairs)), pairs$i)
+
+      for (i_chr in names(idx_by_i)) {
+        idxs  <- idx_by_i[[i_chr]]   # row indices in 'pairs' that share node i
+        u_idx <- as.integer(i_chr)   # node index (1..N)
+
+        # Patch ID at origin node i, and patch IDs at target nodes j for all edges
+        # in the current group.
+        pid_i <- id2patch[u_idx]
+        pid_j <- id2patch[pairs$j[idxs]]
+
+        # Look up polygon row index for patch i and patch j's.
+        poly_i <- pid_to_poly_sp[as.character(pid_i)]
+        rows_j <- unname(pid_to_poly_sp[as.character(pid_j)])
+
+        # st_distance returns a distance matrix (here 1 x length(rows_j)):
+        #   - we cast to numeric vector and compare with disp_m.
+        dists <- sf::st_distance(geom_sp[poly_i], geom_sp[rows_j])
+
+        # Mark edges as "keep" if distance <= dispersal threshold.
+        keep_flag[idxs] <- as.numeric(dists) <= disp_m
+      }
+
+      # If every edge incident to changed patches is within dispersal distance,
+      # then this PU's connectivity is unaffected by distance constraints.
+      if (all(keep_flag)) next
+
+      # ----------------------------------------------------------------
+      # Step 3c: Remove edges that failed the distance test from adjacency.
+      # Edges with keep_flag == FALSE are too long. For each such edge (u, v),
+      # we:
+      #   - remove v from adj[[u]]
+      #   - remove u from adj[[v]]
+      # ensuring the graph remains undirected.
+      # ----------------------------------------------------------------
+      drop_idx <- which(!keep_flag)
+      if (length(drop_idx)) {
+        for (k_edge in drop_idx) {
+          u <- pairs$i[k_edge]  # origin node index
+          v <- pairs$j[k_edge]  # neighbour node index
+
+          # Remove v from u's neighbour list, if present.
+          if (length(adj[[u]])) {
+            adj[[u]] <- adj[[u]][adj[[u]] != v]
+          }
+
+          # Remove u from v's neighbour list, if present.
+          if (length(adj[[v]])) {
+            adj[[v]] <- adj[[v]][adj[[v]] != u]
+          }
+        }
+      }
+
+      # ----------------------------------------------------------------
+      # Step 3d: Convert the updated adjacency back to CSR format.
+      # This is needed so we can pass a CSR graph to .update_pu_components().
+      # ----------------------------------------------------------------
+      lens_new    <- vapply(adj, length, integer(1L))      # degree of each node
+      row_ptr_new <- as.integer(c(0L, cumsum(lens_new)))   # CSR row pointer
+      col_idx_new <- as.integer(unlist(adj, use.names = FALSE))  # CSR columns
+      if (!length(col_idx_new)) col_idx_new <- integer(0L)
+
+      # ----------------------------------------------------------------
+      # Step 3e: Prepare inputs for .update_pu_components().
+      #
+      #   - alive_nodes: vector of length N indicating which nodes exist.
+      #     Here we pass all TRUE because we are not deleting nodes here,
+      #     only edges. Node deletions will be handled by dropping PUs/components.
+      #
+      #   - patch_area: vector of length N with areas (km^2) of patches in this PU.
+      #     We map each id2patch element to patch_dt to retrieve its area.
+      #
+      #   - thr: species-specific PU-level area threshold (min_patch_size500).
+      #
+      #   - next_pu_id_sp: current "next free" PU ID for this species, which
+      #     .update_pu_components() will update if it creates new PUs.
+      # ----------------------------------------------------------------
+      pu_rows_now <- patch_dt[species == sp & pu_id == pu,
+                              .(patch_id, patch_area_km2)]
+
+      # Map id2patch vector into corresponding patch areas.
+      patch_area_vec <- pu_rows_now$patch_area_km2[
+        match(id2patch, pu_rows_now$patch_id)
+      ]
+      # Replace any NA (patch not in pu_rows_now) with 0 to avoid NAs in sums.
+      patch_area_vec[is.na(patch_area_vec)] <- 0
+
+      # Construct a minimal CSR object compatible with .update_pu_components().
+      conn_mod <- list(
+        pu_id    = pu,
+        id2patch = id2patch,
+        row_ptr  = row_ptr_new,
+        col_idx  = col_idx_new
+      )
+
+      # Split this PU into connected components (given the new adjacency),
+      # drop sub-threshold components, and assign PU IDs to surviving ones.
+      res <- .update_pu_components(
+        conn        = conn_mod,
+        alive_nodes = rep(TRUE, length(id2patch)),
+        patch_area  = patch_area_vec,
+        thr         = min_pu_by_species[[sp]],
+        next_pu_id  = next_pu_id_sp
+      )
+
+      # Update species-level next PU ID counter with the value returned
+      # by .update_pu_components(), so future splits use unique IDs.
+      next_pu_id_sp <- res$next_pu_id
+
+      # ----------------------------------------------------------------
+      # Step 3f: Drop patches belonging to components whose PU area
+      #          was below the threshold (res$drop_patches).
+      #
+      # For these dropped patches we:
+      #   - remove them from patch_dt,
+      #   - clear their patch IDs from the species raster,
+      #   - decrement count_work in cells where those patches disappear.
+      # ----------------------------------------------------------------
+      drop_patch_ids <- res$drop_patches
+
+      if (length(drop_patch_ids)) {
+        # Remove dropped patches from patch_dt (only within this PU and species).
+        patch_dt <- patch_dt[
+          !(species == sp & pu_id == pu & patch_id %in% drop_patch_ids)
+        ]
+
+        # Clear these patch IDs from the raster and update count_work.
+        lv       <- get_layer_vals(sp)
+        # cell_idx: cells currently containing any of the dropped patch IDs.
+        cell_idx <- which(!is.na(lv) & (lv %in% drop_patch_ids))
+
+        if (length(cell_idx)) {
+          # Only cells where count_work > 0 should be decremented.
+          hit <- cell_idx[count_work[cell_idx] > 0L]
+          if (length(hit)) {
+            count_work[hit] <- count_work[hit] - 1L
+          }
+          # Remove the patch IDs from the raster.
+          lv[cell_idx] <- NA_integer_
+          # Write updated raster values back into cache.
+          assign(paste0("vals__", sp), lv, envir = vals_cache)
+        }
+      }
+
+      # ----------------------------------------------------------------
+      # Step 3g: Update CSR entries for surviving components.
+      #
+      # res$csr_list contains CSR objects for each surviving component of
+      # this PU after edge removal and sub-threshold component dropping.
+      # We:
+      #   - remove the old PU entry state_env_work[[key]],
+      #   - insert new CSR entries for each component,
+      #   - ensure patch_dt$pu_id is consistent with the new PU IDs.
+      # ----------------------------------------------------------------
+      # Remove the original PU entry; it will be replaced by zero or more new ones.
+      state_env_work[[key]] <- NULL
+
+      csr_list <- res$csr_list
+
+      if (length(csr_list)) {
+        for (j in seq_along(csr_list)) {
+          cobj   <- csr_list[[j]]
+          new_pu <- cobj$pu_id
+          new_key <- paste0(sp, "|", new_pu)
+
+          # Retrieve patch areas (km^2) for the patches in this component.
+          areas_map <- patch_dt[species == sp & pu_id == new_pu,
+                                .(patch_id, patch_area_km2)]
+          patch_area_vec2 <- areas_map$patch_area_km2[
+            match(cobj$id2patch, areas_map$patch_id)
+          ]
+
+          # Construct the new CSR graph object for this component.
+          state_env_work[[new_key]] <- list(
+            species    = sp,
+            pu_id      = new_pu,
+            id2patch   = cobj$id2patch,
+            patch2id   = as.integer(seq_along(cobj$id2patch)),
+            row_ptr    = cobj$row_ptr,
+            col_idx    = cobj$col_idx,
+            alive      = rep(TRUE, length(cobj$id2patch)),
+            patch_area = patch_area_vec2,
+            comp_id    = rep(1L, length(cobj$id2patch)),
+            comp_area  = sum(patch_area_vec2, na.rm = TRUE)
+          )
+
+          # Ensure the patch_dt lookup table uses the new PU ID for all patches
+          # in this component.
+          patch_dt[species == sp & patch_id %in% cobj$id2patch,
+                   pu_id := new_pu]
+        }
+      }
+    } # end loop over PUs for this species
+  }   # end loop over species
+
+  # ------------------------------------------------------------------
+  # Step 4: Remove obsolete CSR entries.
+  #
+  # Some PUs may have disappeared entirely because all their patches were
+  # dropped (e.g., all components sub-threshold). Any CSR entry that no
+  # longer has a counterpart in patch_dt is removed from state_env_work.
+  # ------------------------------------------------------------------
+  # Compute current PU list (species, pu_id) from patch_dt.
+  pu_dt_refined <- patch_dt[
+    ,
+    .(pu_area_km2 = sum(patch_area_km2, na.rm = TRUE)),
+    by = .(species, pu_id)
+  ]
+  data.table::setkey(pu_dt_refined, species, pu_id)
+
+  # Construct keys of PUs that still exist according to patch_dt.
+  keep_keys <- if (nrow(pu_dt_refined)) {
+    paste0(pu_dt_refined$species, "|", as.integer(pu_dt_refined$pu_id))
+  } else {
+    character(0)
+  }
+
+  # Keys present in CSR but absent from patch_dt -> obsolete CSR entries.
+  drop_keys <- setdiff(names(state_env_work), keep_keys)
+  if (length(drop_keys)) {
+    for (k in drop_keys) state_env_work[[k]] <- NULL
+  }
+
+  # ------------------------------------------------------------------
+  # Step 5: Build removal mask and update alive01.
+  #
+  # Cells that had >0 species before (count_before > 0) but now have 0
+  # (count_work == 0) are considered "dead" and should be masked out in
+  # the alive01 raster (set to NA).
+  # ------------------------------------------------------------------
+  removed_idx     <- which(count_before > 0L & count_work == 0L)
+  alive01_refined <- alive01
+  if (length(removed_idx)) {
+    alive01_refined[removed_idx] <- NA
+  }
+
+  # ------------------------------------------------------------------
+  # Final output:
+  #   - patch_dt:    updated patch lookup table with adjusted PUs and dropped patches
+  #   - state_env:   updated per-PU CSR connectivity graphs
+  #   - count_alive: updated per-cell count of species present
+  #   - alive01:     updated alive mask raster (1/NA)
+  #   - removed_indices: indices of cells that became empty in this distance step
+  # ------------------------------------------------------------------
+  list(
+    patch_dt        = patch_dt,
+    state_env       = state_env_work,
+    count_alive     = count_work,
+    alive01         = alive01_refined,
+    removed_indices = removed_idx
+  )
+}
+```
+
+# Global orchestrator
+
+```{r}
+# ------------------------------------------------------------
+# 6. Global Orchestrator (ultra minimal, with masks + 3 logs per stage)
+# ------------------------------------------------------------
+# This function coordinates the entire iterative algorithm.
+# Each "stage" does three things, in this exact order:
+#   1) Pruning:       remove edge cells.
+#   2) Fragmentation: split patches that broke apart and drop tiny fragments.
+#   3) Distance-based connectivity: drop long-distance connections and tiny PUs.
+#
+# After EACH of these three steps we:
+#   - recompute:
+#       * the number of alive cells,
+#       * the number of patches (rows in patch_dt),
+#       * the number of population units (unique species–PU combinations),
+#   - and print ONE log line (with a timestamp) summarizing these three numbers.
+#
+# In addition, this function writes two types of raster masks to disk:
+#   - A fragmentation mask for each stage (cells removed by fragmentation).
+#   - A distance mask for each stage (cells removed by the distance step).
+#
+# Everything else has been stripped down to what is needed for:
+#   - correctness of the algorithm, or
+#   - required outputs (masks), or
+#   - acceptable runtime.
+#
+run_global_orchestrator_simplified <- function(
+  n_remove,          # integer: number of edge cells to remove per pruning iteration
+  k,                 # integer: number of pruning iterations per stage
+  patch_dt,          # data.table: species, patch_id, pu_id, patch_area_km2
+  state_env,         # named list: connectivity objects per PU (CSR), keys "species|pu_id"
+  count_alive,       # integer vector: per-cell count of species currently present
+  patch_stack,       # SpatRaster: one layer per species with patch IDs per cell
+  cs_vals,           # numeric vector: per-cell area (km^2), aligned with raster cell index
+  params,            # data.table: species parameters (min_patch_size, dispersal, etc.)
+  output_dir = "Spatial/Outputs",  # directory to write mask rasters
+  max_stages = 1000L               # hard cap on number of global stages
+) {
+  # Ensure fast joins/updates by keying patch_dt on (species, patch_id).
+  # This is used repeatedly downstream (e.g., patch_dt[.(sp, pid), ]).
+  data.table::setkey(patch_dt, species, patch_id)
+
+  # ------------------------------------------------------------------
+  # Build initial alive cell mask ("alive01")
+  # ------------------------------------------------------------------
+  # We turn count_alive (per-cell number of species) into a 1/NA mask:
+  #   - cells with count_alive > 0 get value 1 (alive),
+  #   - all other cells get NA (dead or outside domain).
+  # The spatial geometry (grid, extent, CRS) is inherited from patch_stack[[1]].
+  alive_vec <- ifelse(!is.na(count_alive) & count_alive > 0L, 1L, NA_integer_)
+  alive01   <- terra::setValues(patch_stack[[1]], alive_vec)
+
+  # Keep track of the index of the last stage that completed successfully.
+  # This is useful if we exit early due to stopping conditions.
+  last_stage_run <- NA_integer_
+
+  # ------------------------------------------------------------
+  # MAIN LOOP OVER GLOBAL STAGES
+  # ------------------------------------------------------------
+  # Each loop iteration corresponds to ONE global stage:
+  #   pruning -> fragmentation -> distance-based connectivity.
+  for (stage_iter in seq_len(max_stages)) {
+
+    # ==========================================================
+    # 1) PRUNING STAGE
+    # ==========================================================
+    # run_pruning_orchestrator:
+    #   - performs k pruning iterations,
+    #   - each iteration removes up to n_remove edge cells,
+    #   - updates:
+    #       * patch_dt (patch areas, patch/PU removals),
+    #       * state_env (per-PU CSR connectivity),
+    #       * count_alive (per-cell alive-species counts),
+    #   - returns:
+    #       * changed_patch_areas: (species, patch_id) that lost area,
+    #       * frontier_exhausted: TRUE if fewer edge cells than n_remove were
+    #         available in some iteration (indicating we reached the “core”).
+    # It may also write per-iteration pruning masks to disk (if output_dir is set).
+    prune_out <- run_pruning_orchestrator(
+      k              = k,
+      n_remove       = n_remove,
+      patch_dt       = patch_dt,
+      state_env      = state_env,
+      count_alive    = count_alive,
+      patch_stack    = patch_stack,
+      cs_vals        = cs_vals,
+      rook_pairs_all = rook_pairs_all,  # global rook adjacency (cell index pairs)
+      params         = params,
+      output_dir     = output_dir,      # allows per-iteration pruning masks
+      stage_iter     = stage_iter       # used in pruning mask filenames
+    )
+
+    # Update our working state with the pruning results.
+    patch_dt           <- prune_out$patch_dt
+    state_env          <- prune_out$state_env
+    count_alive        <- prune_out$count_alive
+    changed_patches    <- prune_out$changed_patch_areas  # (species, patch_id)
+    frontier_exhausted <- isTRUE(prune_out$frontier_exhausted)
+
+    # ----------------------------------------------------------
+    # Summaries AFTER pruning
+    # ----------------------------------------------------------
+    # alive_cells: number of cells that still have at least one species.
+    # n_patches:   number of rows in patch_dt (each row is a patch).
+    # n_pus:       number of unique (species, pu_id) combinations.
+    alive_cells <- sum(count_alive > 0L, na.rm = TRUE)
+    n_patches   <- nrow(patch_dt)
+    n_pus       <- if (n_patches) {
+      data.table::uniqueN(
+        patch_dt[!is.na(pu_id)],
+        by = c("species", "pu_id")
+      )
+    } else 0L
+
+    # LOG 1 of 3 for this stage: AFTER pruning.
+    # .log_console is a lightweight wrapper around cat/message/print
+    # that prefixes messages with a tag (here "stage_prune").
+    .log_console(
+      "stage_prune",
+      "[%s] Stage %d after pruning: alive_cells=%d, patches=%d, pus=%d.",
+      format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+      stage_iter,
+      alive_cells,
+      n_patches,
+      n_pus
+    )
+
+    # Rebuild the alive mask (alive01) from the updated count_alive.
+    # This makes sure that downstream steps (fragmentation and distance)
+    # use the latest set of “alive” cells as their geometric domain.
+    alive_vec <- ifelse(!is.na(count_alive) & count_alive > 0L, 1L, NA_integer_)
+    alive01   <- terra::setValues(alive01, alive_vec)
+
+    # ==========================================================
+    # 2) FRAGMENTATION STAGE
+    # ==========================================================
+    # apply_patch_fragmentation_updates:
+    #   - examines only the patches flagged in changed_patches,
+    #   - re-clumps those patches according to current alive01 geometry,
+    #   - splits patches that are now broken into several fragments,
+    #   - drops any fragment whose area < species-specific min_patch_size,
+    #   - updates:
+    #       * patch_stack (patch ID raster),
+    #       * patch_dt (patch table: patch_id, pu_id, patch_area_km2),
+    #       * state_env (CSR connectivity by PU),
+    #       * count_alive (removing species from cells that lost patches),
+    #       * alive01 (cells that lost all species become NA),
+    #   - outputs:
+    #       * removed_indices: cells that became empty in this stage,
+    #       * patch_ids_to_recheck: patches that changed geometry/ID and
+    #         therefore need distance-based connectivity checks in step 3.
+    frag_out <- apply_patch_fragmentation_updates(
+      patch_stack         = patch_stack,
+      patch_dt            = patch_dt,
+      state_env           = state_env,
+      changed_patch_areas = changed_patches,
+      cs_vals             = cs_vals,
+      params              = params,
+      count_alive         = count_alive,
+      alive01             = alive01
+    )
+
+    # Global cell indices of cells removed during the fragmentation step.
+    # These are cells that had at least one species before fragmentation,
+    # but now have zero species due to dropped patches/fragments.
+    removed_frag <- frag_out$removed_indices
+
+    # Update working state with fragmentation results.
+    patch_stack <- frag_out$patch_stack       # updated patch ID raster
+    patch_dt    <- frag_out$patch_dt          # updated patch lookup table
+    state_env   <- frag_out$state_env         # updated PU connectivity graphs
+    count_alive <- frag_out$count_alive       # updated per-cell alive counts
+    alive01     <- frag_out$alive01           # updated alive mask (1/NA)
+    recheck_ids <- frag_out$patch_ids_to_recheck  # (species, patch_id) for step 3
+
+    # ----------------------------------------------------------
+    # Write fragmentation removal mask (one raster per stage)
+    # ----------------------------------------------------------
+    # Only write a raster if at least one cell was removed by fragmentation.
+    #   - The mask has value 1 in cells removed by fragmentation, NA elsewhere.
+    #   - Filenames encode the global stage index.
+    if (length(removed_frag) > 0L) {
+      mask_frag <- terra::setValues(patch_stack[[1]], NA_integer_)
+      mask_frag[removed_frag] <- 1L
+
+      fn_frag <- file.path(
+        output_dir,
+        sprintf("removed_mask_fragmentation_stage_%04d.tif", stage_iter)
+      )
+      terra::writeRaster(mask_frag, filename = fn_frag, overwrite = TRUE)
+    }
+
+    # ----------------------------------------------------------
+    # Summaries AFTER fragmentation
+    # ----------------------------------------------------------
+    alive_cells <- sum(count_alive > 0L, na.rm = TRUE)
+    n_patches   <- nrow(patch_dt)
+    n_pus       <- if (n_patches) {
+      data.table::uniqueN(
+        patch_dt[!is.na(pu_id)],
+        by = c("species", "pu_id")
+      )
+    } else 0L
+
+    # LOG 2 of 3 for this stage: AFTER fragmentation.
+    .log_console(
+      "stage_frag",
+      "[%s] Stage %d after fragmentation: alive_cells=%d, patches=%d, pus=%d.",
+      format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+      stage_iter,
+      alive_cells,
+      n_patches,
+      n_pus
+    )
+
+    # ==========================================================
+    # 3) DISTANCE-BASED CONNECTIVITY STAGE
+    # ==========================================================
+    # update_connectivity_after_distance:
+    #   - uses recheck_ids (from fragmentation) to identify patches that
+    #     changed geometry or ID,
+    #   - for those patches and their PU neighbours, builds polygons and
+    #     computes patch-to-patch distances,
+    #   - drops graph edges longer than the species-specific dispersal distance,
+    #   - recomputes PU connected components and their total area,
+    #   - drops components whose PU area < species min_patch_size500,
+    #   - updates:
+    #       * patch_dt (drops patches from dropped components, updates pu_id),
+    #       * state_env (CSR connectivity, with PUs split/merged/dropped),
+    #       * count_alive (removes species where patches vanish),
+    #       * alive01 (cells that lose all species become NA).
+    #
+    # Even if recheck_ids is empty, the function returns quickly with no changes,
+    # but we call it unconditionally for simplicity.
+    dist_out <- update_connectivity_after_distance(
+      patch_stack          = patch_stack,
+      patch_dt             = patch_dt,
+      state_env            = state_env,
+      patch_ids_to_recheck = recheck_ids,
+      params               = params,
+      count_alive          = count_alive,
+      alive01              = alive01
+    )
+
+    # Global cell indices of cells removed in this distance step.
+    removed_dist <- dist_out$removed_indices
+
+    # Update working state with distance-based connectivity results.
+    patch_dt    <- dist_out$patch_dt
+    state_env   <- dist_out$state_env
+    count_alive <- dist_out$count_alive
+    alive01     <- dist_out$alive01
+
+    # ----------------------------------------------------------
+    # Write distance removal mask (one raster per stage)
+    # ----------------------------------------------------------
+    # Only write a raster if at least one cell was removed by the distance step.
+    #   - The mask has value 1 in cells removed by distance, NA elsewhere.
+    #   - Filenames encode the global stage index.
+    if (length(removed_dist) > 0L) {
+      mask_dist <- terra::setValues(patch_stack[[1]], NA_integer_)
+      mask_dist[removed_dist] <- 1L
+      fn_dist <- file.path(
+        output_dir,
+        sprintf("removed_mask_distance_stage_%04d.tif", stage_iter)
+      )
+      terra::writeRaster(mask_dist, filename = fn_dist, overwrite = TRUE)
+    }
+
+    # ----------------------------------------------------------
+    # Summaries AFTER distance update
+    # ----------------------------------------------------------
+    alive_cells <- sum(count_alive > 0L, na.rm = TRUE)
+    n_patches   <- nrow(patch_dt)
+    n_pus       <- if (n_patches) {
+      data.table::uniqueN(
+        patch_dt[!is.na(pu_id)],
+        by = c("species", "pu_id")
+      )
+    } else 0L
+
+    # LOG 3 of 3 for this stage: AFTER distance step.
+    .log_console(
+      "stage_dist",
+      "[%s] Stage %d after distance: alive_cells=%d, patches=%d, pus=%d.",
+      format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+      stage_iter,
+      alive_cells,
+      n_patches,
+      n_pus
+    )
+
+    # Record the last stage that fully completed (prune + frag + distance).
+    last_stage_run <- stage_iter
+
+    # --------------------------------------------------------
+    # STOPPING CONDITIONS
+    # --------------------------------------------------------
+    # 1) If no alive cells remain, the landscape is fully “dead” and
+    #    further stages can have no effect, so we stop.
+    if (!any(count_alive > 0L, na.rm = TRUE)) {
+      break
+    }
+
+    # 2) If the pruning orchestrator reported that the edge frontier
+    #    is exhausted (i.e., there were fewer edge cells than n_remove
+    #    at some iteration), there is no further “perimeter” to eat in
+    #    subsequent stages, so we stop after this stage.
+    if (frontier_exhausted) {
+      break
+    }
+  }
+
+  # ------------------------------------------------------------
+  # FINAL PU TABLE
+  # ------------------------------------------------------------
+  # Construct a summary data.table of PUs in the final state:
+  #   - one row per (species, pu_id),
+  #   - pu_area_km2 = sum of areas of all patches belonging to that PU.
+  pu_dt_final <- patch_dt[
+    ,
+    .(pu_area_km2 = sum(patch_area_km2, na.rm = TRUE)),
+    by = .(species, pu_id)
+  ]
+  data.table::setkey(pu_dt_final, species, pu_id)
+
+  # ------------------------------------------------------------
+  # RETURN FINAL STATE
+  # ------------------------------------------------------------
+  # We return:
+  #   - patch_dt:       final patch lookup table,
+  #   - pu_dt:          final PU summary table (per-species, per-PU area),
+  #   - state_env:      final per-PU CSR connectivity graphs,
+  #   - patch_stack:    final patch ID raster stack (one layer per species),
+  #   - alive01:        final alive mask (1/NA),
+  #   - count_alive:    final per-cell alive-species counts,
+  #   - last_stage_run: index of the last finished stage (useful for diagnostics).
+  list(
+    patch_dt       = patch_dt,
+    pu_dt          = pu_dt_final,
+    state_env      = state_env,
+    patch_stack    = patch_stack,
+    alive01        = alive01,
+    count_alive    = count_alive,
+    last_stage_run = last_stage_run
+  )
+}
+```
+
+# Execute
+
+```{r}
+library(data.table)
+library(terra)
+
+## -----------------------------
+## 1. Initial alive state
+## -----------------------------
+
+# Count how many species are present in each cell (across all layers)
+patch_vals_all <- terra::values(patch_stack, mat = TRUE)  # matrix [ncell x nspp]
+count_alive <- rowSums(!is.na(patch_vals_all))
+
+# Alive mask: 1 where any species present, NA elsewhere
+template_rast <- patch_stack[[1L]]
+alive01 <- terra::setValues(template_rast, NA_integer_)
+alive01[count_alive > 0L] <- 1L
+
+## -----------------------------
+## 2. Global orchestrator call
+## -----------------------------
+
+res <- run_global_orchestrator_simplified(
+  n_remove    = 5000L,             # cells to remove per prune iteration
+  k           = 5L,              # pruning iterations per stage
+  patch_dt    = patch_dt,
+  state_env   = state_env,
+  count_alive = count_alive,
+  patch_stack = patch_stack,
+  cs_vals     = cs_vals,          # from cellSize(template_rast, "km")
+  params      = params,
+  output_dir  = "Spatial/Outputs",
+  max_stages  = 2L
+)
+
+## -----------------------------
+## 3. Using the results
+## -----------------------------
+
+final_patch_dt    <- res$patch_dt
+final_pu_dt       <- res$pu_dt
+final_state_env   <- res$state_env
+final_patch_stack <- res$patch_stack
+final_alive01     <- res$alive01
+final_count_alive <- res$count_alive
+last_stage_run    <- res$last_stage_run
+```
