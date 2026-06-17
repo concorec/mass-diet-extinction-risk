@@ -1,0 +1,332 @@
+---
+title: "4_build_species_table"
+output: html_document
+params:
+  write_output: true
+  gompertz_mammals: true
+  gompertz_birds: true
+  iucn_pause_seconds: 2
+  raw_summary: "Data/Raw/simple_summary.csv"
+  raw_synonyms: "Data/Raw/synonyms.csv"
+  raw_mammal_traits: "Data/Raw/mammal_data.txt"
+  raw_bird_traits: "Data/Raw/bird_data.txt"
+  raw_random_effects: "Data/Raw/random_effects.csv"
+  mammal_ppm_dir: "mammal_ppm_bin"
+  mammal_rangebag_dir: "mammal_rangebag_bin"
+  bird_ppm_dir: "bird_ppm_bin"
+  bird_rangebag_dir: "bird_rangebag_bin"
+  gompertz_models: "Data/Clean/gompertz_loess_models.rds"
+  species_table: "Data/Clean/species_table.csv"
+  figure_focal_species: "Pterocles personatus"
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# Assemble the canonical species table used by the spatial stages.
+source("R/project_utils.R")
+source("R/species_table_config.R")
+source("R/figure_utils.R")
+
+WRITE_OUTPUT <- isTRUE(params$write_output)
+USE_GOMPERTZ_MAMMALS <- isTRUE(params$gompertz_mammals)
+USE_GOMPERTZ_BIRDS <- isTRUE(params$gompertz_birds)
+IUCN_PAUSE_SECONDS <- as.numeric(params$iucn_pause_seconds)
+CURVES <- species_table_curves()
+PATHS <- list(
+  raw = list(
+    summary = params$raw_summary,
+    synonyms = params$raw_synonyms,
+    mammal_traits = params$raw_mammal_traits,
+    bird_traits = params$raw_bird_traits,
+    random_effects = params$raw_random_effects
+  ),
+  rasters = tibble::tribble(
+    ~taxon_class, ~sdm_method, ~dir_path,
+    "Mammalia", "PPM", params$mammal_ppm_dir,
+    "Mammalia", "RangeBag", params$mammal_rangebag_dir,
+    "Aves", "PPM", params$bird_ppm_dir,
+    "Aves", "RangeBag", params$bird_rangebag_dir
+  ),
+  clean = list(
+    gompertz_models = params$gompertz_models,
+    species_table = params$species_table
+  )
+)
+
+load_species_table_packages()
+source("R/species_table_inputs.R")
+source("R/species_table_traits.R")
+source("R/species_table_iucn.R")
+source("R/species_table_build.R")
+
+validate_species_table_config(
+  params = params,
+  paths = PATHS,
+  use_gompertz_mammals = USE_GOMPERTZ_MAMMALS,
+  use_gompertz_birds = USE_GOMPERTZ_BIRDS,
+  write_output = WRITE_OUTPUT,
+  iucn_pause_seconds = IUCN_PAUSE_SECONDS
+)
+```
+
+```{r build_species_table}
+species_table <- build_species_table(
+  paths = PATHS,
+  curves = CURVES,
+  use_gompertz_mammals = USE_GOMPERTZ_MAMMALS,
+  use_gompertz_birds = USE_GOMPERTZ_BIRDS,
+  iucn_pause_seconds = IUCN_PAUSE_SECONDS
+)
+
+if (WRITE_OUTPUT) {
+  readr::write_csv(species_table, PATHS$clean$species_table)
+  message("Wrote: ", PATHS$clean$species_table)
+}
+
+class_counts <- species_table |>
+  dplyr::count(className, name = "n")
+
+message(
+  "Species table complete | rows=", nrow(species_table),
+  " | ", paste(paste0(class_counts$className, "=", class_counts$n), collapse = ", ")
+)
+```
+
+```{r fig_area_curve_focal_species, fig.width=6.4, fig.height=3.3}
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(scales)
+})
+
+dat_out <- if (exists("species_table", inherits = FALSE)) {
+  species_table
+} else if (file.exists(PATHS$clean$species_table)) {
+  readr::read_csv(PATHS$clean$species_table, show_col_types = FALSE, progress = FALSE)
+} else {
+  stop(
+    "Could not find species_table data for the area-curve figure.\n",
+    "Expected an in-memory species_table object or file: ", PATHS$clean$species_table,
+    call. = FALSE
+  )
+}
+
+theme_area_curve <- function(base_size = 11.5) {
+  ggplot2::theme_classic(base_size = base_size) +
+    ggplot2::theme(
+      plot.margin  = ggplot2::margin(7, 18, 6, 12),
+      axis.title   = ggplot2::element_text(face = "bold", colour = "grey10"),
+      axis.text    = ggplot2::element_text(colour = "grey20"),
+      axis.line    = ggplot2::element_line(linewidth = 0.45, colour = "grey20"),
+      axis.ticks   = ggplot2::element_line(linewidth = 0.45, colour = "grey20"),
+      panel.grid.major.y = ggplot2::element_line(colour = "grey94", linewidth = 0.28),
+      panel.grid.major.x = ggplot2::element_blank(),
+      panel.grid.minor   = ggplot2::element_blank(),
+      legend.position    = "none"
+    )
+}
+
+sp_name <- stringr::str_squish(as.character(params$figure_focal_species))
+curve_use <- "q50"
+
+sp_row <- dat_out |>
+  dplyr::filter(scientificName == sp_name) |>
+  dplyr::slice(1)
+
+if (nrow(sp_row) == 0) {
+  stop(paste0("Species not found in species_table: ", sp_name), call. = FALSE)
+}
+
+dens  <- as.numeric(sp_row$density)
+alpha <- as.numeric(sp_row[[paste0("alpha_", curve_use)]])
+beta  <- as.numeric(sp_row[[paste0("beta_",  curve_use)]])
+A0    <- as.numeric(sp_row$min_pop_size)
+
+if (!is.finite(dens) || dens <= 0 || !is.finite(alpha) || alpha <= 0 ||
+    !is.finite(beta) || beta <= 0 || !is.finite(A0) || A0 <= 0) {
+  stop(
+    paste0(
+      "The required persistence parameters are missing or invalid for ", sp_name, ".\n",
+      "Check density, alpha_", curve_use, ", beta_", curve_use, ", and min_pop_size in species_table."
+    ),
+    call. = FALSE
+  )
+}
+
+c_eff <- alpha * dens^(-beta)
+
+delta_star <- c_eff^(1 / beta)
+delta_grid <- 10^seq(log10(delta_star / 80), log10(delta_star * 350), length.out = 1400)
+
+A <- A0 + delta_grid
+
+log_z <- log(c_eff) - beta * log(delta_grid)
+z <- exp(log_z)
+
+P <- exp(-z)
+
+log_dP <- (-z) + log(c_eff) + log(beta) - (beta + 1) * log(delta_grid)
+dP <- exp(log_dP)
+
+df <- tibble::tibble(
+  area_km2 = c(A0, A),
+  P = c(0, P),
+  dP = c(0, dP)
+) |>
+  dplyr::arrange(area_km2)
+
+s_deriv <- max(df$dP[is.finite(df$dP)], na.rm = TRUE)
+df <- df |>
+  dplyr::mutate(dP_scaled = dP / s_deriv)
+
+band_cut <- 0.35
+band_df <- df |>
+  dplyr::filter(dP_scaled >= band_cut)
+
+x_band_lo <- min(band_df$area_km2, na.rm = TRUE)
+x_band_hi <- max(band_df$area_km2, na.rm = TRUE)
+
+x_sat <- df |>
+  dplyr::filter(P >= 0.995) |>
+  dplyr::summarise(x = min(area_km2, na.rm = TRUE)) |>
+  dplyr::pull(x)
+
+if (!is.finite(x_sat)) x_sat <- max(df$area_km2, na.rm = TRUE)
+
+x_min <- max(A0 * 0.85, x_band_lo / 1.35)
+x_max <- max(x_sat * 1.18, x_band_hi * 1.12)
+
+x_min <- min(x_min, A0 * 0.96)
+x_max <- max(x_max, A0 * 1.04)
+
+plot_df <- df |>
+  dplyr::filter(area_km2 >= A0, area_km2 <= x_max)
+
+interp_y <- function(x, y, xout) {
+  stats::approx(x = x, y = y, xout = xout, rule = 2)$y
+}
+
+x_at_frac <- function(frac, xmin, xmax) {
+  10^(log10(xmin) + frac * (log10(xmax) - log10(xmin)))
+}
+
+x_lab_p <- x_at_frac(0.96, x_min, x_max)
+y_lab_p <- max(
+  min(interp_y(plot_df$area_km2, plot_df$P, x_lab_p) - 0.070, 0.85),
+  0.74
+)
+
+x_lab_d <- x_at_frac(0.66, x_min, x_max)
+y_lab_d <- max(
+  min(interp_y(plot_df$area_km2, plot_df$dP_scaled, x_lab_d) + 0.040, 0.78),
+  0.15
+)
+
+x_lab_a0 <- A0 * 1.15
+y_lab_a0 <- 0.1
+
+col_p <- "#0072B2"
+col_dp <- "grey35"
+col_A0 <- "grey40"
+fill_band <- "grey80"
+
+lwd_p <- 1.20
+lwd_dp <- 0.88
+lty_dp <- "22"
+lwd_A0 <- 0.60
+lty_A0 <- "dotted"
+
+a0_in_view <- is.finite(A0) && A0 >= x_min && A0 <= x_max
+
+area_curve_figure <- ggplot2::ggplot(plot_df, ggplot2::aes(x = area_km2)) +
+  ggplot2::annotate(
+    "rect",
+    xmin = x_band_lo,
+    xmax = x_band_hi,
+    ymin = 0,
+    ymax = 1,
+    fill = fill_band,
+    alpha = 0.12
+  ) +
+  ggplot2::geom_vline(
+    xintercept = A0,
+    linewidth  = lwd_A0,
+    linetype   = lty_A0,
+    colour     = col_A0
+  ) +
+  ggplot2::geom_line(
+    ggplot2::aes(y = P),
+    linewidth = lwd_p,
+    lineend   = "round",
+    colour    = col_p,
+    na.rm     = TRUE
+  ) +
+  ggplot2::geom_line(
+    ggplot2::aes(y = dP_scaled),
+    linewidth = lwd_dp,
+    linetype  = lty_dp,
+    lineend   = "round",
+    colour    = col_dp,
+    na.rm     = TRUE
+  ) +
+  ggplot2::annotate(
+    "label",
+    x = x_lab_p,
+    y = y_lab_p,
+    label = "Persistence probability",
+    hjust = 1,
+    size = 3.15,
+    label.padding = grid::unit(0.10, "lines"),
+    linewidth = 0,
+    fill = scales::alpha("white", 0.88),
+    colour = col_p
+  ) +
+  ggplot2::annotate(
+    "label",
+    x = x_lab_d,
+    y = y_lab_d,
+    label = "Marginal sensitivity (scaled)",
+    hjust = 0,
+    size = 3.10,
+    label.padding = grid::unit(0.10, "lines"),
+    linewidth = 0,
+    fill = scales::alpha("white", 0.88),
+    colour = "grey20"
+  ) +
+  ggplot2::scale_x_log10(
+    limits = c(x_min, x_max),
+    breaks = scales::breaks_log(n = 4),
+    labels = scales::label_comma(),
+    expand = ggplot2::expansion(mult = c(0.01, 0.03))
+  ) +
+  ggplot2::scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, by = 0.2),
+    labels = scales::label_number(accuracy = 0.1),
+    expand = ggplot2::expansion(mult = c(0, 0.01))
+  ) +
+  ggplot2::labs(
+    x = expression("Habitat area, " * A * " (km"^2*")"),
+    y = "Persistence probability"
+  ) +
+  ggplot2::coord_cartesian(clip = "off") +
+  theme_area_curve(base_size = 11.5)
+
+if (isTRUE(a0_in_view)) {
+  area_curve_figure <- area_curve_figure +
+    ggplot2::annotate(
+      "label",
+      x = x_lab_a0,
+      y = y_lab_a0,
+      label = "A[0*','*s]",
+      parse = TRUE,
+      angle = 90,
+      size = 3.0,
+      label.padding = grid::unit(0.05, "lines"),
+      linewidth = 0,
+      fill = scales::alpha("white", 0.96),
+      colour = "grey15"
+    )
+}
+
+save_manuscript_figure(area_curve_figure, "area_curve")
+area_curve_figure
+```

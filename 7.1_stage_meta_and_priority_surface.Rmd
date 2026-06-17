@@ -1,0 +1,36 @@
+---
+title: "7.1_stage_meta_and_priority_surface"
+output: html_document
+params:
+  curve: "q025"
+  taxa: "mammals_birds"
+  sdm: "ppm_rangebag"
+  cells_to_remove_per_iteration: 1000
+  pruning_iterations_per_stage: 100
+  ana_subdir: "ana"
+  stage_meta_name: "stage_meta.csv"
+  overwrite: true
+  validate_bundle_metadata: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# Build stage metadata for a completed script-6 priority run and validate the
+# canonical proportional-removal priority surface, rankmap.tif.
+if (requireNamespace("knitr", quietly = TRUE)) {
+  knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+}
+```
+
+```{r run_stage_meta_surface}
+source("R/stage7_stage_meta_surface.R", local = knitr::knit_global(), print.eval = TRUE)
+```
+
+```{r summary, echo=FALSE}
+cat("\nStage 7.1 summary\n")
+cat("=================\n")
+cat("Curve: ", params$curve, "\n", sep = "")
+cat("Taxa: ", params$taxa, "\n", sep = "")
+cat("SDM: ", params$sdm, "\n", sep = "")
+if (exists("stage_meta_csv")) cat("Stage metadata: ", stage_meta_csv, "\n", sep = "")
+if (exists("priority_surface_tif")) cat("Priority surface: ", priority_surface_tif, "\n", sep = "")
+```

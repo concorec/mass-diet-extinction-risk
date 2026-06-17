@@ -1,0 +1,193 @@
+---
+title: "2_persist_points_crn"
+output: html_document
+params:
+  run_mammals: true
+  run_birds: false
+  force_rerun_bird_combos: false
+  rebuild_cpp: true
+  verbose: false
+  run_crn_self_test: true
+  cap_factor: 1.1
+  r_buffer: 0.8
+  n_draws: 760
+  reps: 2500
+  chunk_size: 25
+  base_seed: 123
+  p_anchor: [0.025, 0.16, 0.50, 0.84, 0.975]
+  p_grid_lower: 0.025
+  p_grid_step: 0.025
+  p_grid_upper: 0.975
+  p_grid_extra: 0.99
+  k_search_start_k: 512
+  k_search_rel_tol: 0.01
+  k_search_round_k: true
+  mammal_mass_grid: "Data/Clean/mammal_mass_grid.csv"
+  bird_mass_grid: "Data/Clean/bird_mass_grid.csv"
+  bird_ilr_coords: "Data/Clean/bird_ilr_combo_coords.csv"
+  post_m_rm: "Data/Clean/post_mammal_rm_coefs.csv"
+  post_m_sigma: "Data/Clean/post_mammal_sigma_coefs.csv"
+  post_b_rm: "Data/Clean/post_bird_r_coefs.csv"
+  post_b_sigma: "Data/Clean/post_bird_sigma_ilr_coefs.csv"
+  cpp_file: "src/simulate_persist_probs_cpp.cpp"
+  rcpp_cache: "Data/.rcpp_cache"
+  results_dir: "Data/Results"
+  mammals_points: "Data/Results/persist_points_mammals.csv"
+  birds_points: "Data/Results/persist_points_birds.csv"
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+## Persistence-point simulation driver.
+##
+## Contract:
+##   - Use posterior demographic draws from script 1.
+##   - Use the optimized C++ common-random-number simulator.
+##   - Write tidy persistence-point tables for script 3.
+##   - Keep expensive simulation settings centralized and explicit.
+
+source("R/persist_config.R")
+
+RUN_MAMMALS <- isTRUE(params$run_mammals)
+RUN_BIRDS <- isTRUE(params$run_birds)
+VERBOSE <- isTRUE(params$verbose)
+
+message(describe_persist_params(params, "R Markdown params"))
+
+SIM <- list(
+  quasi_extinction_abundance = quasi_extinction_abundance(),
+  years = persistence_horizon_years(),
+  cap_factor = as.numeric(params$cap_factor),
+  r_buffer = as.numeric(params$r_buffer),
+  n_draws = as.integer(params$n_draws),
+  reps = as.integer(params$reps),
+  chunk_size = as.integer(params$chunk_size),
+  base_seed = as.integer(params$base_seed)
+)
+
+GRID <- list(
+  q_levels = persistence_quantiles(),
+  p_anchor = as.numeric(params$p_anchor),
+  p_grid = c(
+    seq(
+      as.numeric(params$p_grid_lower),
+      as.numeric(params$p_grid_upper),
+      by = as.numeric(params$p_grid_step)
+    ),
+    as.numeric(params$p_grid_extra)
+  ),
+  k_search = list(
+    start_k = as.numeric(params$k_search_start_k),
+    rel_tol = as.numeric(params$k_search_rel_tol),
+    round_k = isTRUE(params$k_search_round_k)
+  )
+)
+
+PATHS <- list(
+  mammal_mass_grid = params$mammal_mass_grid,
+  bird_mass_grid = params$bird_mass_grid,
+  bird_ilr_coords = params$bird_ilr_coords,
+  post_m_rm = params$post_m_rm,
+  post_m_sigma = params$post_m_sigma,
+  post_b_rm = params$post_b_rm,
+  post_b_sigma = params$post_b_sigma,
+  cpp_file = params$cpp_file,
+  rcpp_cache = params$rcpp_cache,
+  results_dir = params$results_dir,
+  mammals_points = params$mammals_points,
+  birds_points = params$birds_points
+)
+
+load_persist_packages()
+source("R/persist_inputs.R")
+source("R/persist_simulation.R")
+
+validate_persist_config(params, SIM, GRID)
+
+inputs <- load_persist_inputs(PATHS, params, SIM)
+CRN_CTX <- create_crn_context(SIM)
+
+if (isTRUE(params$run_crn_self_test)) {
+  run_crn_self_test(SIM)
+}
+
+message(
+  "Setup OK | RUN_MAMMALS=", RUN_MAMMALS,
+  " RUN_BIRDS=", RUN_BIRDS,
+  " n_draws=", SIM$n_draws,
+  " reps=", SIM$reps,
+  " years=", SIM$years,
+  " bird_combos=", if (RUN_BIRDS) nrow(inputs$birds$ilr) else 0L
+)
+```
+
+```{r run_mammals}
+if (RUN_MAMMALS) {
+  log_msg("MAMMALS | start", flush = VERBOSE)
+
+  run_one_scenario(
+    masses_g = inputs$mammals$mass,
+    sampler = make_mammal_sampler(inputs$mammals, SIM),
+    out_file = PATHS$mammals_points,
+    crn_ctx = CRN_CTX,
+    combo = NA_character_,
+    sim = SIM,
+    grid = GRID,
+    append = FALSE,
+    verbose = VERBOSE
+  )
+
+  validate_points_schema(
+    PATHS$mammals_points,
+    "mammal persistence points",
+    min_k = SIM$quasi_extinction_abundance
+  )
+
+  log_msg("MAMMALS | wrote: ", PATHS$mammals_points, flush = VERBOSE)
+  log_msg("MAMMALS | done", flush = VERBOSE)
+} else {
+  log_msg("MAMMALS | skipped because params$run_mammals is FALSE", flush = TRUE)
+}
+```
+
+```{r run_birds}
+if (RUN_BIRDS) {
+  log_msg("BIRDS | start", flush = VERBOSE)
+
+  bird_combos_all <- inputs$birds$ilr[order(combo), as.character(combo)]
+
+  run_bird_combo_set(
+    combo_ids = bird_combos_all,
+    bird_inputs = inputs$birds,
+    paths = PATHS,
+    sim = SIM,
+    grid = GRID,
+    crn_ctx = CRN_CTX,
+    force = isTRUE(params$force_rerun_bird_combos),
+    verbose = VERBOSE
+  )
+
+  combo_counts <- finalize_bird_output(inputs$birds, PATHS, GRID)
+  print(combo_counts)
+  validate_points_schema(
+    PATHS$birds_points,
+    "bird persistence points",
+    min_k = SIM$quasi_extinction_abundance
+  )
+
+  log_msg("BIRDS | canonical output written: ", PATHS$birds_points, flush = VERBOSE)
+  log_msg("BIRDS | done", flush = VERBOSE)
+} else {
+  log_msg("BIRDS | skipped because params$run_birds is FALSE", flush = TRUE)
+}
+```
+
+```{r output_summary}
+outputs <- data.table::data.table(
+  output = c("mammal persistence points", "bird persistence points"),
+  path = c(PATHS$mammals_points, PATHS$birds_points),
+  requested_this_run = c(RUN_MAMMALS, RUN_BIRDS)
+)
+outputs[, exists := file.exists(path)]
+outputs[, size_mb := ifelse(exists, round(file.info(path)$size / 1024^2, 3), NA_real_)]
+print(outputs)
+```

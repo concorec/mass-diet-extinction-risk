@@ -1,0 +1,107 @@
+---
+title: "5_build_patches_and_connectivity"
+output: html_document
+params:
+  do_mammals: true
+  do_birds: true
+  species_csv: "Data/Clean/species_table.csv"
+  landcover_tif: "Data/Raw/esacci_2022_pfts.tif"
+  patch_dir: "Data/Clean/Patches"
+  patch_lookup_rds: "Data/Clean/all_patch_lookup.rds"
+  connectivity_rds: "Data/Clean/all_connectivity.rds"
+  grass_dir: ""
+  roi_xmin: 43.18
+  roi_xmax: 50.56
+  roi_ymin: -25.64
+  roi_ymax: -11.89
+  overwrite_patch_rasters: true
+  stop_on_species_error: false
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# Build habitat patches and dispersal-connected population units.
+#
+# Canonical outputs:
+#   - Data/Clean/Patches/<species>.tif
+#   - Data/Clean/all_patch_lookup.rds
+#   - Data/Clean/all_connectivity.rds
+
+if (requireNamespace("knitr", quietly = TRUE)) {
+  knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+}
+
+source("R/patch_config.R")
+load_patch_packages(include_figures = FALSE)
+source("R/patch_species_inputs.R")
+source("R/patch_habitat.R")
+source("R/patch_processing.R")
+
+paths <- patch_paths(params)
+run_options <- patch_run_options(params)
+roi <- patch_roi(params)
+
+validate_patch_config(
+  paths = paths,
+  run_options = run_options,
+  roi = roi,
+  production = TRUE
+)
+```
+
+```{r prepare_inputs}
+selected_species <- read_patch_species_table(
+  species_csv = paths$species_csv,
+  do_mammals = run_options$do_mammals,
+  do_birds = run_options$do_birds
+)
+
+message(
+  "Validation OK | selected species = ", nrow(selected_species),
+  " | mammals = ", sum(selected_species$class_lc == "mammalia"),
+  " | birds = ", sum(selected_species$class_lc == "aves")
+)
+```
+
+```{r habitat_masks}
+# ESA CCI land-cover classes are translated into reusable 1/NA habitat masks.
+habitat_masks <- load_habitat_masks(paths$landcover_tif, roi)
+template <- habitat_masks[[1]]
+valid_mask_layers <- names(habitat_masks)
+
+message("Built ", terra::nlyr(habitat_masks), " habitat-mask layers on the analysis grid.")
+```
+
+```{r run_pipeline}
+patch_pipeline <- run_patch_pipeline(
+  selected_species = selected_species,
+  paths = paths,
+  run_options = run_options,
+  habitat_masks = habitat_masks
+)
+
+results <- patch_pipeline$results
+status_summary <- patch_pipeline$status_summary
+all_patch_lookup <- patch_pipeline$all_patch_lookup
+all_connectivity <- patch_pipeline$all_connectivity
+
+saveRDS(all_patch_lookup, paths$patch_lookup_rds)
+saveRDS(all_connectivity, paths$connectivity_rds)
+
+message("Wrote patch lookup: ", paths$patch_lookup_rds)
+message("Wrote connectivity object: ", paths$connectivity_rds)
+message("Wrote patch rasters to: ", paths$patch_dir)
+```
+
+```{r summary, echo=FALSE}
+# Compact knitted summary. This chunk does not write files.
+cat("\nPatch and population-unit construction summary\n")
+cat("==============================================\n")
+cat("Selected species: ", nrow(selected_species), "\n", sep = "")
+cat("Retained species with at least one final PU: ", sum(status_summary$status == "retained"), "\n", sep = "")
+cat("Skipped or errored species: ", sum(status_summary$status != "retained"), "\n", sep = "")
+cat("Final patches: ", nrow(all_patch_lookup), "\n", sep = "")
+cat("Final population units: ", length(all_connectivity), "\n", sep = "")
+cat("\nStatus counts:\n")
+print(table(status_summary$status, useNA = "ifany"))
+
+```

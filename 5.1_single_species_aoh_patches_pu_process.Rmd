@@ -1,0 +1,87 @@
+---
+title: "5.1_single_species_aoh_patches_pu_process"
+output: html_document
+params:
+  target_species: "Cryptoprocta ferox"
+  species_csv: "Data/Clean/species_table.csv"
+  landcover_tif: "Data/Raw/esacci_2022_pfts.tif"
+  grass_dir: ""
+  roi_xmin: 43.18
+  roi_xmax: 50.56
+  roi_ymin: -25.64
+  roi_ymax: -11.89
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# Single-species visual walkthrough of habitat-mask, mapped-habitat, patch, and
+# population-unit construction. This script is for figure production only; it does
+# not create canonical pipeline inputs.
+
+if (requireNamespace("knitr", quietly = TRUE)) {
+  knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+}
+
+source("R/patch_config.R")
+source("R/figure_utils.R")
+load_patch_packages(include_figures = TRUE)
+source("R/patch_species_inputs.R")
+source("R/patch_habitat.R")
+source("R/patch_processing.R")
+source("R/patch_process_figure.R")
+
+paths <- patch_paths(params)
+run_options <- patch_run_options(params)
+roi <- patch_roi(params)
+
+validate_patch_config(
+  paths = paths,
+  run_options = run_options,
+  roi = roi,
+  production = FALSE
+)
+```
+
+```{r target_species}
+target_row <- read_single_patch_species(
+  species_csv = paths$species_csv,
+  target_species = params$target_species
+)
+
+message("Target species OK: ", target_row$scientificName)
+```
+
+```{r compute_single_species_layers}
+layers <- build_single_species_layers(
+  target_row = target_row,
+  paths = paths,
+  roi = roi
+)
+
+labels_mixed <- layers$labels_mixed
+habitat01 <- layers$habitat01
+presence01 <- layers$presence01
+mapped_habitat01 <- layers$mapped_habitat01
+n_raw_patches <- layers$n_raw_patches
+n_kept_patches <- layers$n_kept_patches
+n_candidate_pus <- layers$n_candidate_pus
+n_final_pus <- layers$n_final_pus
+```
+
+```{r make_process_figure, fig.width=8.5, fig.height=9.1, dpi=300}
+process_figure <- make_single_species_process_figure(layers)
+save_manuscript_figure(process_figure, "spatial_process")
+process_figure
+```
+
+```{r figure_summary, echo=FALSE}
+cat("\nSingle-species process summary\n")
+cat("==============================\n")
+cat("Species: ", target_row$scientificName, "\n", sep = "")
+cat("Distribution raster: ", target_row$raster_path, "\n", sep = "")
+cat("Habitat labels: ", paste(labels_mixed, collapse = ", "), "\n", sep = "")
+cat("Mapped-habitat area: ", fmt_area_km2(raster_area_km2(mapped_habitat01)), "\n", sep = "")
+cat("Raw patches: ", n_raw_patches, "\n", sep = "")
+cat("Retained patches: ", n_kept_patches, "\n", sep = "")
+cat("Candidate population units: ", n_candidate_pus, "\n", sep = "")
+cat("Final population units: ", n_final_pus, "\n", sep = "")
+```

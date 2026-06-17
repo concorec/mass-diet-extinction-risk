@@ -1,0 +1,40 @@
+---
+title: "7.2_build_rank_lut"
+output: html_document
+params:
+  curve: "q025"
+  taxa: "mammals_birds"
+  sdm: "ppm_rangebag"
+  cells_to_remove_per_iteration: 1000
+  pruning_iterations_per_stage: 100
+  rank_method: "abf"
+  rank_map_subdir: "benchmark_rank_maps"
+  ana_subdir: "ana"
+  stage_meta_name: "stage_meta.csv"
+  species_csv: "Data/Clean/species_table.csv"
+  patch_dir: "Data/Clean/Patches"
+  grass_dir: ""
+  lut_prefix: "lut_stage_"
+  overwrite: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# Build stage-level benchmark rank lookup tables for a completed script-6 run.
+if (requireNamespace("knitr", quietly = TRUE)) {
+  knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+}
+```
+
+```{r run_rank_lut}
+source("R/stage7_rank_lut.R", local = knitr::knit_global(), print.eval = TRUE)
+```
+
+```{r summary, echo=FALSE}
+cat("\nStage 7.2 summary\n")
+cat("=================\n")
+cat("Curve: ", params$curve, "\n", sep = "")
+cat("Taxa: ", params$taxa, "\n", sep = "")
+cat("SDM: ", params$sdm, "\n", sep = "")
+cat("Rank method: ", params$rank_method, "\n", sep = "")
+if (exists("lut_root")) cat("LUT directory: ", lut_root, "\n", sep = "")
+```

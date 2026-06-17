@@ -1,0 +1,141 @@
+---
+title: "6_spatial_prioritization_pipeline"
+output: html_document
+params:
+  initialize_inputs: false
+  run_pipeline: false
+  curve_label: "q025"
+  do_mammals: true
+  do_birds: true
+  do_ppm: true
+  do_rangebag: true
+  cells_to_remove_per_iteration: 1000
+  pruning_iterations_per_stage: 100
+  max_stages: 100
+  species_table_csv: "Data/Clean/species_table.csv"
+  patch_raster_dir: "Data/Clean/Patches"
+  patch_lookup_rds: "Data/Clean/all_patch_lookup.rds"
+  connectivity_rds: "Data/Clean/all_connectivity.rds"
+  pruning_input_bundle_dir: "Data/Clean/PriorityInputs"
+  pipeline_output_root: "Data/Results/PriorityRuns"
+---
+
+```{r setup, message=TRUE, warning=FALSE}
+# Stage-wise spatial prioritization.
+#
+# Canonical outputs:
+#   - Data/Clean/PriorityInputs/pruning_inputs_*.rds
+#   - Data/Results/PriorityRuns/*/removal_order.tif
+#   - Data/Results/PriorityRuns/*/rankmap.tif
+#   - Data/Results/PriorityRuns/*/removal_events.csv
+#   - Data/Results/PriorityRuns/*/patch_lookup_tables/*.csv
+
+if (requireNamespace("knitr", quietly = TRUE)) {
+  knitr::opts_chunk$set(message = TRUE, warning = FALSE)
+}
+
+source("R/project_utils.R")
+source("R/priority_run_config.R")
+source("R/priority_pruning_frontier.R")
+source("R/priority_pruning_scoring.R")
+source("R/priority_pruning_graph.R")
+source("R/priority_pruning_iteration.R")
+source("R/priority_pruning_stage.R")
+source("R/priority_fragmentation_patches.R")
+source("R/priority_fragmentation_graph.R")
+source("R/priority_fragmentation_stage.R")
+source("R/priority_distance_geometry.R")
+source("R/priority_distance_graph.R")
+source("R/priority_distance_stage.R")
+source("R/priority_pipeline.R")
+source("R/priority_inputs.R")
+source("R/priority_saved_run.R")
+
+priority_settings <- list(
+  curve_label = params$curve_label,
+  do_mammals = isTRUE(params$do_mammals),
+  do_birds = isTRUE(params$do_birds),
+  do_ppm = isTRUE(params$do_ppm),
+  do_rangebag = isTRUE(params$do_rangebag),
+  cells_to_remove_per_iteration = as.integer(params$cells_to_remove_per_iteration),
+  pruning_iterations_per_stage = as.integer(params$pruning_iterations_per_stage),
+  max_stages = params$max_stages,
+  species_table_csv_path = params$species_table_csv,
+  patch_raster_dir = params$patch_raster_dir,
+  patch_lookup_rds_path = params$patch_lookup_rds,
+  connectivity_rds_path = params$connectivity_rds,
+  pruning_input_bundle_dir = params$pruning_input_bundle_dir,
+  pipeline_output_root = params$pipeline_output_root
+)
+
+stopifnot(is.logical(params$initialize_inputs), length(params$initialize_inputs) == 1L)
+stopifnot(is.logical(params$run_pipeline), length(params$run_pipeline) == 1L)
+```
+
+```{r initialize_priority_inputs}
+if (isTRUE(params$initialize_inputs)) {
+  priority_initialization <- initialize_priority_inputs(
+    curve_label = priority_settings$curve_label,
+    do_mammals = priority_settings$do_mammals,
+    do_birds = priority_settings$do_birds,
+    do_ppm = priority_settings$do_ppm,
+    do_rangebag = priority_settings$do_rangebag,
+    species_table_csv_path = priority_settings$species_table_csv_path,
+    patch_raster_dir = priority_settings$patch_raster_dir,
+    patch_lookup_rds_path = priority_settings$patch_lookup_rds_path,
+    connectivity_rds_path = priority_settings$connectivity_rds_path,
+    pruning_input_bundle_dir = priority_settings$pruning_input_bundle_dir
+  )
+} else {
+  priority_initialization <- NULL
+  message("Skipping pruning-input initialization; set params$initialize_inputs = TRUE to rebuild the input bundle.")
+}
+```
+
+```{r run_priority_pipeline}
+if (isTRUE(params$run_pipeline)) {
+  priority_run <- run_priority_pipeline_from_saved_bundle(
+    curve_label = priority_settings$curve_label,
+    do_mammals = priority_settings$do_mammals,
+    do_birds = priority_settings$do_birds,
+    do_ppm = priority_settings$do_ppm,
+    do_rangebag = priority_settings$do_rangebag,
+    cells_to_remove_per_iteration = priority_settings$cells_to_remove_per_iteration,
+    pruning_iterations_per_stage = priority_settings$pruning_iterations_per_stage,
+    max_stages = priority_settings$max_stages,
+    pruning_input_bundle_dir = priority_settings$pruning_input_bundle_dir,
+    patch_raster_dir = priority_settings$patch_raster_dir,
+    pipeline_output_root = priority_settings$pipeline_output_root
+  )
+} else {
+  priority_run <- NULL
+  message("Skipping full priority run; set params$run_pipeline = TRUE to run the stage-wise pipeline.")
+}
+```
+
+```{r summary, echo=FALSE}
+cat("\nSpatial prioritization driver summary\n")
+cat("=====================================\n")
+cat("Initialize inputs: ", params$initialize_inputs, "\n", sep = "")
+cat("Run pipeline: ", params$run_pipeline, "\n", sep = "")
+cat("Curve label: ", priority_settings$curve_label, "\n", sep = "")
+cat("Mammals: ", priority_settings$do_mammals, " | Birds: ", priority_settings$do_birds, "\n", sep = "")
+cat("PPM: ", priority_settings$do_ppm, " | RangeBag: ", priority_settings$do_rangebag, "\n", sep = "")
+
+if (!is.null(priority_initialization)) {
+  cat("\nInitialized bundle:\n")
+  cat(priority_initialization$pruning_input_bundle_path, "\n", sep = "")
+  cat("Retained species: ", nrow(priority_initialization$species_params), "\n", sep = "")
+  cat("Initial alive cells: ", sum(priority_initialization$alive_species_count_by_cell > 0L), "\n", sep = "")
+}
+
+if (!is.null(priority_run)) {
+  result <- priority_run$priority_pipeline_result
+  cat("\nPriority run output:\n")
+  cat(priority_run$pipeline_output_dir, "\n", sep = "")
+  cat("Completed stages: ", result$completed_stages, "\n", sep = "")
+  cat("Removal events: ", result$removal_events_path, "\n", sep = "")
+  cat("Removal raster: ", result$removal_order_path, "\n", sep = "")
+  cat("Rank map: ", result$rankmap_path, "\n", sep = "")
+}
+```

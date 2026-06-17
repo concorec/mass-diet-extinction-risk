@@ -1,0 +1,170 @@
+---
+title: "5.2_build_binary_patch_rasters_zonation_feature_list"
+output: html_document
+params:
+  patch_raster_dir: "Data/Clean/Patches"
+  binary_patch_raster_dir: "Data/Clean/Patches_binary"
+  zonation_parent_dir: "Data/Clean/ZonationOutputs"
+  benchmark_rank_map_dir: "Data/Clean/ZonationOutputs/benchmark_rank_maps"
+  overwrite: true
+---
+
+```{r setup, message=TRUE, warning=FALSE}
+if (requireNamespace("knitr", quietly = TRUE)) {
+  knitr::opts_chunk$set(message = TRUE, warning = FALSE)
+}
+
+if (!requireNamespace("terra", quietly = TRUE)) {
+  stop("The 'terra' package is required.")
+}
+
+patch_raster_dir <- params$patch_raster_dir
+binary_patch_raster_dir <- params$binary_patch_raster_dir
+zonation_parent_dir <- params$zonation_parent_dir
+benchmark_rank_map_dir <- params$benchmark_rank_map_dir
+feature_list_path <- file.path(
+  zonation_parent_dir,
+  "zonation_binary_patch_feature_list.txt"
+)
+zonation_modes <- c("ABF", "CAZ1", "CAZ2", "CAZMAX")
+zonation_output_dirs <- file.path(zonation_parent_dir, zonation_modes)
+names(zonation_output_dirs) <- tolower(zonation_modes)
+overwrite_outputs <- isTRUE(params$overwrite)
+
+if (!dir.exists(patch_raster_dir)) {
+  stop("Missing patch raster directory: ", patch_raster_dir)
+}
+
+dir.create(binary_patch_raster_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(zonation_parent_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(benchmark_rank_map_dir, recursive = TRUE, showWarnings = FALSE)
+invisible(vapply(
+  zonation_output_dirs,
+  dir.create,
+  logical(1L),
+  recursive = TRUE,
+  showWarnings = FALSE
+))
+
+patch_raster_paths <- list.files(
+  patch_raster_dir,
+  pattern = "\\.tif$",
+  full.names = TRUE
+)
+
+if (!length(patch_raster_paths)) {
+  stop("No .tif patch rasters found in: ", patch_raster_dir)
+}
+
+patch_raster_paths <- sort(patch_raster_paths)
+```
+
+```{r build_binary_rasters}
+binary_raster_paths <- vapply(
+  patch_raster_paths,
+  function(input_path) {
+    output_path <- file.path(
+      binary_patch_raster_dir,
+      basename(input_path)
+    )
+
+    patch_raster <- terra::rast(input_path)
+    binary_raster <- terra::ifel(is.na(patch_raster), NA, 1)
+    names(binary_raster) <- names(patch_raster)
+
+    terra::writeRaster(
+      binary_raster,
+      filename = output_path,
+      overwrite = overwrite_outputs,
+      datatype = "INT2S",
+      NAflag = -32768
+    )
+
+    output_path
+  },
+  character(1L)
+)
+```
+
+```{r write_feature_list}
+feature_list <- data.frame(
+  weight = rep(1, length(binary_raster_paths)),
+  filename = normalizePath(binary_raster_paths, winslash = "/", mustWork = FALSE),
+  stringsAsFactors = FALSE
+)
+
+writeLines(
+  c(
+    '"weight" "filename"',
+    sprintf(
+      "%s %s",
+      format(feature_list$weight, scientific = FALSE, trim = TRUE),
+      shQuote(feature_list$filename, type = "cmd")
+    )
+  ),
+  con = feature_list_path
+)
+
+message("Wrote ", length(binary_raster_paths), " binary patch raster(s) to: ", binary_patch_raster_dir)
+message("Wrote Zonation feature list to: ", feature_list_path)
+message("Created Zonation output directories under: ", zonation_parent_dir)
+```
+
+```{r copy_zonation_rankmaps_to_benchmark}
+zonation_rankmap_table <- data.frame(
+  mode = names(zonation_output_dirs),
+  source = file.path(unname(zonation_output_dirs), "rankmap.tif"),
+  target = file.path(
+    benchmark_rank_map_dir,
+    paste0("rankmap_", names(zonation_output_dirs), ".tif")
+  ),
+  stringsAsFactors = FALSE
+)
+
+rankmap_exists <- file.exists(zonation_rankmap_table$source)
+
+copied_rankmaps <- if (any(rankmap_exists)) {
+  file.copy(
+    from = zonation_rankmap_table$source[rankmap_exists],
+    to = zonation_rankmap_table$target[rankmap_exists],
+    overwrite = overwrite_outputs
+  )
+} else {
+  logical(0L)
+}
+
+if (any(!rankmap_exists)) {
+  message(
+    "Skipping missing Zonation rankmap(s): ",
+    paste(zonation_rankmap_table$mode[!rankmap_exists], collapse = ", ")
+  )
+}
+
+if (length(copied_rankmaps)) {
+  copied_modes <- zonation_rankmap_table$mode[rankmap_exists][copied_rankmaps]
+  message(
+    "Copied Zonation rankmap(s) to benchmark directory: ",
+    paste(copied_modes, collapse = ", ")
+  )
+} else {
+  message("No Zonation rankmap.tif files were available to copy.")
+}
+```
+
+```{r summary, echo=FALSE}
+cat("\nBinary patch raster summary\n")
+cat("===========================\n")
+cat("Input patch raster directory: ", patch_raster_dir, "\n", sep = "")
+cat("Binary patch raster directory: ", binary_patch_raster_dir, "\n", sep = "")
+cat("Zonation parent directory: ", zonation_parent_dir, "\n", sep = "")
+cat("Feature list: ", feature_list_path, "\n", sep = "")
+cat("Zonation output directories:\n")
+cat(paste0("  - ", zonation_output_dirs, collapse = "\n"), "\n", sep = "")
+cat("Benchmark rank map directory: ", benchmark_rank_map_dir, "\n", sep = "")
+if (exists("zonation_rankmap_table")) {
+  cat("Benchmark rank map targets:\n")
+  cat(paste0("  - ", zonation_rankmap_table$target, collapse = "\n"), "\n", sep = "")
+}
+cat("Rasters processed: ", length(binary_raster_paths), "\n", sep = "")
+cat("Feature weight: 1 for every raster\n")
+```

@@ -1,0 +1,708 @@
+---
+title: "1_rm_sigma_models"
+output: html_document
+params:
+  run_fits: true
+  seed: 123
+  n_chains: 3
+  n_adapt: 5000
+  n_iter: 5000
+  thin: 10
+  tau_beta: 0.001
+  sigma_min: 0
+  sigma_max: 1
+  raw_mammal_rmax: "Data/Raw/mammal_rmax.txt"
+  raw_bird_traits: "Data/Raw/bird_data.txt"
+  raw_sigma: "Data/Raw/sigma.csv"
+  raw_bird_synonyms: "Data/Raw/bird_synonyms.csv"
+  post_mammal_rm: "Data/Clean/post_mammal_rm_coefs.csv"
+  post_mammal_sigma: "Data/Clean/post_mammal_sigma_coefs.csv"
+  post_bird_rm: "Data/Clean/post_bird_r_coefs.csv"
+  post_bird_sigma_ilr3: "Data/Clean/post_bird_sigma_ilr_coefs.csv"
+  bird_ilr_combo_coords: "Data/Clean/bird_ilr_combo_coords.csv"
+  bird_mass_grid: "Data/Clean/bird_mass_grid.csv"
+  mammal_mass_grid: "Data/Clean/mammal_mass_grid.csv"
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# Calibrate body-mass and diet relationships for demographic simulation inputs.
+source("R/project_utils.R")
+source("R/figure_utils.R")
+source("R/rm_sigma_config.R")
+
+RUN_FITS <- isTRUE(params$run_fits)
+paths <- list(
+  raw = list(
+    mammal_rmax = params$raw_mammal_rmax,
+    bird_traits = params$raw_bird_traits,
+    sigma = params$raw_sigma,
+    bird_synonyms = params$raw_bird_synonyms
+  ),
+  clean = list(
+    post_mammal_rm = params$post_mammal_rm,
+    post_mammal_sigma = params$post_mammal_sigma,
+    post_bird_rm = params$post_bird_rm,
+    post_bird_sigma_ilr3 = params$post_bird_sigma_ilr3,
+    bird_ilr_combo_coords = params$bird_ilr_combo_coords,
+    bird_mass_grid = params$bird_mass_grid,
+    mammal_mass_grid = params$mammal_mass_grid
+  )
+)
+BAYES <- bayes_config(params)
+expected_draws <- BAYES$n_chains * BAYES$n_iter / BAYES$thin
+
+load_packages(required_rm_sigma_packages(RUN_FITS))
+source("R/compositions.R")
+source("R/rm_sigma_data.R")
+source("R/rm_sigma_models.R")
+source("R/rm_sigma_figures.R")
+
+set.seed(BAYES$seed)
+assert_raw_inputs_exist(paths)
+ensure_dir("Data/Clean")
+assert_jags_available(RUN_FITS)
+
+if (!RUN_FITS) {
+  assert_posterior_inputs_exist(paths)
+  assert_posterior_schema(paths, expected_draws)
+}
+```
+
+```{r prepare_calibration_data}
+inputs <- read_calibration_inputs(paths)
+cal <- prepare_calibration_data(inputs)
+
+mammal_rmax <- cal$mammal_rmax
+mammal_sigma <- cal$mammal_sigma
+bird_rmax <- cal$bird_rmax
+bird_sigma_data <- cal$bird_sigma_data
+bird_sigma_model_compare_data <- cal$bird_sigma_model_compare_data
+
+ilr_design <- bird_ilr_combo_design()
+readr::write_csv(ilr_design, paths$clean$bird_ilr_combo_coords)
+readr::write_csv(tibble::tibble(Mass_g = log_space(2, 11236, 31)), paths$clean$bird_mass_grid)
+readr::write_csv(tibble::tibble(Mass_g = log_space(2, 4750000, 31)), paths$clean$mammal_mass_grid)
+
+message(
+  "Calibration data ready | mammal rm=", nrow(mammal_rmax),
+  " | mammal sigma=", nrow(mammal_sigma),
+  " | bird rm=", nrow(bird_rmax),
+  " | bird sigma=", nrow(bird_sigma_data),
+  " | diet combos=", nrow(ilr_design)
+)
+```
+
+```{r fit_models_and_write_posteriors}
+if (RUN_FITS) {
+  fit_all_demographic_models(cal, paths, BAYES)
+  assert_posterior_schema(paths, expected_draws)
+} else {
+  message("Reusing existing posterior coefficient files.")
+}
+```
+
+```{r}
+## ---- figure_2 --------------------------------------------------------------
+## Purpose: Figure 2 built entirely from in-memory objects (no disk reads/writes).
+## Inputs assumed to exist from earlier chunks:
+##   - bird_sigma_data (Mass_g, sigma, Diet_5Cat, Diet_Inv, Diet_AllPlants, Diet_VertFishScav)
+##   - helpers: zero_replace(), to_ilr3(), simplex_grid_10pct(), mass_grid_from_data(), theme_pub()
+
+diet_parts <- c("Diet_Inv", "Diet_AllPlants", "Diet_VertFishScav")
+
+# =============================================================================
+# 1) Plotting table (single clean transform used for both panels)
+# =============================================================================
+bird_plot <- bird_sigma_data |>
+  dplyr::transmute(
+    Mass_g    = Mass_g,
+    logMass   = log10(Mass_g),
+    logSigma  = log10(sigma),
+    Diet_5Cat = dplyr::if_else(
+      is.na(Diet_5Cat) | !nzchar(Diet_5Cat),
+      "Unknown",
+      as.character(Diet_5Cat)
+    ),
+    dplyr::across(dplyr::all_of(diet_parts))
+  )
+
+diet_order <- c("FruiNect", "Invertebrate", "Omnivore", "PlantSeed", "VertFishScav", "Unknown")
+diet_levels <- c(
+  intersect(diet_order, unique(bird_plot$Diet_5Cat)),
+  setdiff(sort(unique(bird_plot$Diet_5Cat)), diet_order)
+)
+
+diet_labels <- c(
+  FruiNect     = "Fruit + nectar",
+  Invertebrate = "Invertebrate",
+  Omnivore     = "Omnivore",
+  PlantSeed    = "Plant + seed",
+  VertFishScav = "Vertebrate + fish + scavenging",
+  Unknown      = "Unknown"
+)[diet_levels]
+
+diet_pal <- stats::setNames(
+  viridisLite::viridis(length(diet_levels), option = "D", end = 0.9),
+  diet_levels
+)
+if ("Unknown" %in% diet_levels) diet_pal["Unknown"] <- "grey70"
+
+bird_plot <- bird_plot |>
+  dplyr::mutate(Diet_5Cat = factor(Diet_5Cat, levels = diet_levels))
+
+# =============================================================================
+# 2) Panel (a): observed log10(sigma_r) vs mass + mass-only OLS line
+# =============================================================================
+fit_mass_only <- stats::lm(logSigma ~ logMass, data = bird_plot)
+r2_mass <- summary(fit_mass_only)$r.squared
+
+mass_grid <- mass_grid_from_data(bird_plot$Mass_g, n = 250) |>
+  dplyr::mutate(logMass = log10(Mass_g))
+
+mass_grid$logSigma_hat <- as.numeric(stats::predict(fit_mass_only, newdata = mass_grid))
+
+x_breaks_A <- c(10, 100, 1000, 10000)
+x_breaks_A <- x_breaks_A[
+  x_breaks_A >= min(bird_plot$Mass_g, na.rm = TRUE) &
+    x_breaks_A <= max(bird_plot$Mass_g, na.rm = TRUE) * 1.02
+]
+
+pA <- ggplot2::ggplot(bird_plot, ggplot2::aes(Mass_g, logSigma, color = Diet_5Cat)) +
+  ggplot2::geom_point(size = 1.7, alpha = 0.9) +
+  ggplot2::geom_line(
+    data = mass_grid,
+    ggplot2::aes(x = Mass_g, y = logSigma_hat),
+    inherit.aes = FALSE,
+    linewidth = 0.8,
+    lineend = "round",
+    color = "grey15"
+  ) +
+  ggplot2::annotate(
+    "label",
+    x = Inf, y = Inf,
+    label = sprintf("R\u00b2 = %.2f", r2_mass),
+    hjust = 1.02, vjust = 1.08,
+    label.size = 0.25,
+    label.padding = grid::unit(0.14, "lines"),
+    label.r = grid::unit(0.10, "lines"),
+    fill = scales::alpha("white", 0.92),
+    color = "grey10",
+    size = 3.8,
+    fontface = "bold"
+  ) +
+  ggplot2::scale_x_log10(
+    breaks = x_breaks_A,
+    labels = scales::label_number(big.mark = ","),
+    expand = ggplot2::expansion(mult = c(0.02, 0.05))
+  ) +
+  ggplot2::scale_y_continuous(
+    breaks = scales::pretty_breaks(n = 4),
+    expand = ggplot2::expansion(mult = c(0.04, 0.06))
+  ) +
+  ggplot2::scale_color_manual(values = diet_pal, labels = diet_labels, drop = FALSE) +
+  ggplot2::labs(
+    x = "Body mass (g)",
+    y = expression(log[10](sigma[r])),
+    color = "Diet"
+  ) +
+  ggplot2::guides(
+    color = ggplot2::guide_legend(
+      title.position = "left",
+      title.theme = ggplot2::element_text(margin = ggplot2::margin(r = 6)),
+      nrow = 1, byrow = TRUE,
+      override.aes = list(size = 3.2, alpha = 1)
+    )
+  ) +
+  theme_pub(base_size = 11) +
+  ggplot2::theme(
+    legend.position   = "bottom",
+    legend.box        = "horizontal",
+    legend.direction  = "horizontal",
+    legend.box.margin = ggplot2::margin(t = -2, b = 0),
+    legend.margin     = ggplot2::margin(t = 0, b = 0)
+  )
+
+# =============================================================================
+# 3) Panel (b): mass-adjusted diet effect across the simplex
+# =============================================================================
+bird_ilr <- dplyr::bind_cols(
+  bird_plot,
+  to_ilr3(bird_plot[, diet_parts] / 100)
+)
+
+fit_ilr <- stats::lm(logSigma ~ logMass + ilr1 + ilr2, data = bird_ilr)
+r2_ilr <- summary(fit_ilr)$r.squared
+
+grid_prop <- simplex_grid_10pct()
+grid_ilr  <- to_ilr3(grid_prop)
+
+grid_plot <- dplyr::bind_cols(grid_prop, grid_ilr)
+
+coefs <- stats::coef(fit_ilr)
+
+# Diet component of the fitted model. Because the model is additive, this surface
+# does not depend on the reference body mass. Values are shown relative to an
+# equal three-part diet composition, whose ILR coordinates are approximately zero.
+grid_plot$diet_effect <- as.numeric(
+  coefs["ilr1"] * grid_plot$ilr1 +
+    coefs["ilr2"] * grid_plot$ilr2
+)
+
+fill_limits <- range(grid_plot$diet_effect, finite = TRUE)
+
+fill_breaks <- pretty(fill_limits, n = 4)
+fill_breaks <- fill_breaks[
+  fill_breaks >= fill_limits[1] - 1e-8 &
+    fill_breaks <= fill_limits[2] + 1e-8
+]
+
+pB <- ggtern::ggtern(
+  grid_plot,
+  ggplot2::aes(
+    x = Diet_AllPlants,
+    y = Diet_VertFishScav,
+    z = Diet_Inv,
+    fill = diet_effect
+  )
+) +
+  ggplot2::geom_point(
+    shape = 21,
+    size = 2.3,
+    stroke = 0.2,
+    colour = "grey20"
+  ) +
+  ggplot2::scale_fill_viridis_c(
+    option = "plasma",
+    end = 0.95,
+    limits = fill_limits,
+    breaks = fill_breaks,
+    labels = scales::label_number(accuracy = 0.05)
+  ) +
+  ggplot2::labs(
+    x = NULL, y = NULL, z = NULL,
+    L = "Plants",
+    R = "Vertebrates",
+    T = "Invertebrates",
+    fill = expression(Delta ~ log[10](sigma[r]))
+  ) +
+  theme_pub(base_size = 11) +
+  ggplot2::theme(
+    tern.panel.grid.major = ggplot2::element_blank(),
+    tern.panel.grid.minor = ggplot2::element_blank(),
+    tern.axis.text        = ggplot2::element_blank(),
+    tern.axis.ticks       = ggplot2::element_blank(),
+    tern.axis.title.T     = ggplot2::element_text(face = "bold", colour = "grey15", size = 10.5),
+    tern.axis.title.L     = ggplot2::element_text(face = "bold", colour = "grey15", size = 10.5),
+    tern.axis.title.R     = ggplot2::element_text(face = "bold", colour = "grey15", size = 10.5),
+    legend.position       = "bottom",
+    legend.box.margin     = ggplot2::margin(t = -12, b = 4),
+    legend.margin         = ggplot2::margin(t = 0, b = 2)
+  ) +
+  ggplot2::guides(
+    fill = ggplot2::guide_colorbar(
+      direction = "horizontal",
+      title.position = "top",
+      title.hjust = 0.5,
+      label.position = "bottom",
+      barwidth = grid::unit(4.4, "cm"),
+      barheight = grid::unit(0.46, "cm"),
+      ticks = TRUE
+    )
+  )
+
+# =============================================================================
+# 4) Assemble: top row + raised colorbar row + diet legend row
+# =============================================================================
+legend_A <- cowplot::get_legend(pA)
+legend_B <- cowplot::get_legend(pB)
+
+panel_row <- cowplot::plot_grid(
+  pA + ggplot2::theme(legend.position = "none"),
+  pB + ggplot2::theme(legend.position = "none"),
+  nrow = 1,
+  rel_widths = c(1.0, 1.03),
+  labels = c("(a)", "(b)"),
+  label_fontface = "bold",
+  label_size = 13,
+  align = "h",
+  axis = "tb"
+)
+
+colorbar_row <- cowplot::plot_grid(
+  cowplot::ggdraw(),
+  legend_B,
+  nrow = 1,
+  rel_widths = c(1.0, 1.03)
+)
+
+fig2 <- cowplot::plot_grid(
+  panel_row,
+  colorbar_row,
+  legend_A,
+  ncol = 1,
+  rel_heights = c(1, 0.14, 0.08)
+)
+
+fig2
+save_manuscript_figure(fig2, "bird_sigma")
+```
+
+```{r}
+## ---- figS_allometry_2x2 -----------------------------------------------------
+## SI FIGURE (2x2): Allometric calibration relationships
+## Purpose: pure plotting from in-memory calibration datasets.
+## Notes:
+##   - Mammal rm, mammal sigma_r, and bird rm uncertainty bands use posterior draw CSVs.
+##   - Bird sigma_r has no posterior in this workflow, so we use an OLS 95% confidence band.
+##   - No files are written; the figure is printed in the Rmd.
+
+# =============================================================================
+# 1) Point datasets (already built in-memory upstream)
+# =============================================================================
+dat_mammal_rm    <- dplyr::transmute(mammal_rmax,     Mass = Mass_g, y = rm)
+dat_mammal_sigma <- dplyr::transmute(mammal_sigma,    Mass = Mass_g, y = sigma)
+dat_bird_rm      <- dplyr::transmute(bird_rmax,       Mass = Mass_g, y = rm)
+dat_bird_sigma   <- dplyr::transmute(bird_sigma_data, Mass = Mass_g, y = sigma)
+
+mammal_xlim <- range(c(dat_mammal_rm$Mass, dat_mammal_sigma$Mass), finite = TRUE)
+bird_xlim   <- range(c(dat_bird_rm$Mass,   dat_bird_sigma$Mass),   finite = TRUE)
+
+x_breaks_mammal <- c(10, 1e3, 1e5)
+x_breaks_bird   <- c(10, 1e2, 1e3, 1e4)
+
+# =============================================================================
+# 2) Uncertainty bands on the original scale (y), derived on log10 scale
+# =============================================================================
+
+# Posterior band for log10(y) = alpha + beta_logM * log10(Mass), back-transformed to y.
+band_from_posterior <- function(mass_grid, draws_path) {
+  draws <- readr::read_csv(
+    draws_path,
+    show_col_types = FALSE,
+    col_select = dplyr::all_of(c("alpha", "beta_logM"))
+  )
+
+  logM <- log10(mass_grid)
+  pred_log10 <- draws$alpha + tcrossprod(draws$beta_logM, logM)  # [n_draws x n_grid]
+  pred <- 10^pred_log10
+
+  qs <- apply(pred, 2, stats::quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)
+  tibble::tibble(Mass = mass_grid, lo = qs[1, ], mid = qs[2, ], hi = qs[3, ])
+}
+
+# OLS band: fit on log10 scale, take 95% CI, back-transform to y.
+band_from_ols <- function(df, mass_grid) {
+  fit <- stats::lm(log10(y) ~ log10(Mass), data = df)
+  pr  <- stats::predict(
+    fit,
+    newdata  = data.frame(Mass = mass_grid),
+    interval = "confidence",
+    level    = 0.95
+  )
+
+  tibble::tibble(
+    Mass = mass_grid,
+    lo   = 10^pr[, "lwr"],
+    mid  = 10^pr[, "fit"],
+    hi   = 10^pr[, "upr"]
+  )
+}
+
+# One small panel builder: points + band + compact N/R^2 annotation.
+make_panel <- function(df, y_lab, x_limits, x_breaks, draws_path = NULL) {
+  df <- df[df$Mass > 0 & df$y > 0 & is.finite(df$Mass) & is.finite(df$y), , drop = FALSE]
+
+  mass_grid <- log_space(x_limits[1], x_limits[2], n = 300)
+  band <- if (is.null(draws_path)) band_from_ols(df, mass_grid) else band_from_posterior(mass_grid, draws_path)
+
+  r2  <- summary(stats::lm(log10(y) ~ log10(Mass), data = df))$r.squared
+  ann <- sprintf("N = %d\nR\u00b2 = %.2f", nrow(df), r2)
+
+  ggplot2::ggplot(df, ggplot2::aes(Mass, y)) +
+    ggplot2::geom_ribbon(
+      data = band,
+      ggplot2::aes(x = Mass, ymin = lo, ymax = hi),
+      inherit.aes = FALSE,
+      fill = "grey60",
+      alpha = 0.25
+    ) +
+    ggplot2::geom_line(
+      data = band,
+      ggplot2::aes(x = Mass, y = mid),
+      inherit.aes = FALSE,
+      linewidth = 0.75,
+      color = "grey10"
+    ) +
+    ggplot2::geom_point(size = 1.2, alpha = 0.65, color = "grey10") +
+    ggplot2::annotate(
+      "label",
+      x = Inf, y = Inf,
+      label = ann,
+      hjust = 1.02, vjust = 1.05,
+      label.size = 0,
+      fill = scales::alpha("white", 0.85),
+      size = 3.6,
+      fontface = "bold",
+      color = "grey10"
+    ) +
+    ggplot2::scale_x_log10(
+      limits = x_limits,
+      breaks = x_breaks,
+      labels = scales::label_number(big.mark = ",")
+    ) +
+    ggplot2::scale_y_log10(labels = scales::label_number(big.mark = ",")) +
+    ggplot2::labs(x = "Body mass (g)", y = y_lab) +
+    theme_pub(base_size = 12) +
+    ggplot2::theme(aspect.ratio = 0.72)
+}
+
+# =============================================================================
+# 3) Build the 2x2 panels
+# =============================================================================
+pA <- make_panel(
+  dat_mammal_rm,
+  expression(r[m]),
+  x_limits = mammal_xlim, x_breaks = x_breaks_mammal,
+  draws_path = paths$clean$post_mammal_rm
+)
+
+pB <- make_panel(
+  dat_bird_rm,
+  expression(r[m]~~"(from"~~lambda[max]~~")"),
+  x_limits = bird_xlim, x_breaks = x_breaks_bird,
+  draws_path = paths$clean$post_bird_rm
+)
+
+pC <- make_panel(
+  dat_mammal_sigma,
+  expression(sigma[r]),
+  x_limits = mammal_xlim, x_breaks = x_breaks_mammal,
+  draws_path = paths$clean$post_mammal_sigma
+)
+
+pD <- make_panel(
+  dat_bird_sigma,
+  expression(sigma[r]),
+  x_limits = bird_xlim, x_breaks = x_breaks_bird,
+  draws_path = NULL
+)
+
+# Reduce repeated axis titles (tick labels stay)
+pA <- pA + ggplot2::theme(axis.title.x = ggplot2::element_blank())
+pB <- pB + ggplot2::theme(axis.title.x = ggplot2::element_blank(),
+                          axis.title.y = ggplot2::element_blank())
+pD <- pD + ggplot2::theme(axis.title.y = ggplot2::element_blank())
+
+# =============================================================================
+# 4) Assemble + print
+# =============================================================================
+headers <- cowplot::ggdraw() +
+  cowplot::draw_label("Mammals", x = 0.25, y = 0.5, fontface = "bold", size = 14) +
+  cowplot::draw_label("Birds",   x = 0.75, y = 0.5, fontface = "bold", size = 14)
+
+grid <- cowplot::plot_grid(
+  pA, pB, pC, pD,
+  ncol = 2,
+  labels = c("(a)", "(b)", "(c)", "(d)"),
+  label_fontface = "bold",
+  label_size = 14,
+  align = "hv"
+)
+
+figSI_allometry <- cowplot::plot_grid(headers, grid, ncol = 1, rel_heights = c(0.06, 1))
+
+figSI_allometry
+save_manuscript_figure(figSI_allometry, "allometry")
+```
+
+```{r}
+## ---- figS_bird_sigma_models_compare ----------------------------------------
+## SI FIGURE (2x2): Bird sigma_r model comparison (in-sample fitted values vs mass)
+## Purpose: pure plotting from in-memory objects (no disk reads).
+##
+## Inputs already exist upstream:
+##   - bird_sigma_model_compare_data
+##   - helpers: add_ilr_from_percent(), theme_pub()
+##
+## Output:
+##   - Printed figure only (no files written).
+
+# =============================================================================
+# 1) Modeling frame (keep only what we use)
+# =============================================================================
+df <- bird_sigma_model_compare_data |>
+  dplyr::transmute(
+    Mass_g   = Mass_g,
+    sigma    = sigma,
+
+    # One explicit label for missing/blank diet classes (keeps legend stable)
+    Diet_5Cat = dplyr::if_else(is.na(Diet_5Cat) | !nzchar(Diet_5Cat), "Unknown", as.character(Diet_5Cat)),
+
+    Diet_Inv          = Diet_Inv,
+    Diet_VertFishScav = Diet_VertFishScav,
+    Diet_PlantSeed    = Diet_PlantSeed,
+    Diet_FruiNect     = Diet_FruiNect
+  ) |>
+  dplyr::mutate(
+    Diet_AllPlants  = Diet_PlantSeed + Diet_FruiNect,
+    Diet_AllAnimals = Diet_Inv + Diet_VertFishScav,
+    logMass  = log10(Mass_g),
+    logSigma = log10(sigma),
+    Diet_5Cat = factor(Diet_5Cat)
+  )
+
+# Legend ordering: use only levels present (but keep a consistent preferred order).
+diet_order <- c("Invertebrate", "PlantSeed", "Omnivore", "VertFishScav", "FruiNect", "Unknown")
+diet_levels <- intersect(diet_order, levels(df$Diet_5Cat))
+df$Diet_5Cat <- factor(as.character(df$Diet_5Cat), levels = diet_levels)
+
+diet_labels <- c(
+  Invertebrate = "Invertebrates",
+  PlantSeed    = "Plants + seeds",
+  Omnivore     = "Omnivore",
+  VertFishScav = "Vertebrates",
+  FruiNect     = "Fruit + nectar",
+  Unknown      = "Unknown"
+)[diet_levels]
+
+diet_pal <- stats::setNames(
+  viridisLite::viridis(length(diet_levels), option = "D", end = 0.9),
+  diet_levels
+)
+if ("Unknown" %in% diet_levels) diet_pal["Unknown"] <- "grey70"
+
+# =============================================================================
+# 2) ILR variants (all share row order of df)
+# =============================================================================
+df_bin <- add_ilr_from_percent(df, c("Diet_AllPlants", "Diet_AllAnimals"), prefix = "bin_ilr")
+df_ter <- add_ilr_from_percent(df, c("Diet_Inv", "Diet_AllPlants", "Diet_VertFishScav"), prefix = "ter_ilr")
+df_qua <- add_ilr_from_percent(df, c("Diet_Inv", "Diet_VertFishScav", "Diet_PlantSeed", "Diet_FruiNect"), prefix = "qua_ilr")
+
+# =============================================================================
+# 3) Fit candidate OLS models + compute delta BIC (all in-sample)
+# =============================================================================
+specs <- list(
+  `Mass-only`      = list(data = df,     formula = logSigma ~ logMass),
+  `Binary ILR`     = list(data = df_bin, formula = logSigma ~ logMass + bin_ilr1),
+  `Ternary ILR`    = list(data = df_ter, formula = logSigma ~ logMass + ter_ilr1 + ter_ilr2),
+  `Quaternary ILR` = list(data = df_qua, formula = logSigma ~ logMass + qua_ilr1 + qua_ilr2 + qua_ilr3)
+)
+
+fit_one <- function(spec) {
+  m <- stats::lm(spec$formula, data = spec$data)
+  list(
+    pred = as.numeric(stats::predict(m)),
+    r2   = summary(m)$r.squared,
+    bic  = stats::BIC(m)
+  )
+}
+
+fits <- lapply(specs, fit_one)
+bics <- vapply(fits, `[[`, numeric(1), "bic")
+delta_bic <- bics - min(bics)
+
+# Shared axes across panels
+xlim <- range(df$Mass_g, finite = TRUE)
+x_breaks <- c(1, 10, 1e2, 1e3, 1e4, 1e5)
+x_breaks <- x_breaks[x_breaks >= xlim[1] & x_breaks <= xlim[2]]
+x_break_labels <- function(x) {
+  x <- as.numeric(x)
+  dplyr::case_when(
+    x >= 1000 ~ paste0(scales::label_number(accuracy = 1)(x / 1000), "k"),
+    TRUE ~ scales::label_number(accuracy = 1)(x)
+  )
+}
+
+pred_all <- unlist(lapply(fits, `[[`, "pred"), use.names = FALSE)
+ylims <- range(pred_all, finite = TRUE)
+ylims <- ylims + c(-1, 1) * 0.08 * diff(ylims)
+y_breaks <- pretty(ylims, n = 4)
+
+# =============================================================================
+# 4) Panel builder
+# =============================================================================
+make_panel <- function(pred, title, r2, dBIC) {
+  ggplot2::ggplot(
+    dplyr::mutate(df, pred = pred),
+    ggplot2::aes(x = Mass_g, y = pred, color = Diet_5Cat)
+  ) +
+    ggplot2::geom_point(size = 1.2, alpha = 0.65) +
+    ggplot2::annotate(
+      "label",
+      x = Inf, y = Inf,
+      label = sprintf("R\u00b2 = %.2f\n\u0394BIC = %.1f", r2, dBIC),
+      hjust = 1.02, vjust = 1.05,
+      label.size = 0,
+      fill = scales::alpha("white", 0.85),
+      size = 3.6,
+      fontface = "bold",
+      color = "grey10"
+    ) +
+    ggplot2::scale_x_log10(
+      limits = xlim,
+      breaks = x_breaks,
+      labels = x_break_labels
+    ) +
+    ggplot2::scale_y_continuous(
+      limits = ylims,
+      breaks = y_breaks,
+      labels = scales::label_number()
+    ) +
+    ggplot2::scale_color_manual(values = diet_pal, labels = diet_labels, drop = FALSE) +
+    ggplot2::labs(
+      title = title,
+      x = "Body mass (g)",
+      y = expression(Predicted ~ log[10](sigma[r])),
+      color = "Diet"
+    ) +
+    theme_pub(base_size = 12) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold", hjust = 0.5),
+      legend.position = "none",
+      aspect.ratio = 0.72
+    )
+}
+
+nm <- names(fits)
+pA <- make_panel(fits[[1]]$pred, nm[1], fits[[1]]$r2, delta_bic[1])
+pB <- make_panel(fits[[2]]$pred, nm[2], fits[[2]]$r2, delta_bic[2])
+pC <- make_panel(fits[[3]]$pred, nm[3], fits[[3]]$r2, delta_bic[3])
+pD <- make_panel(fits[[4]]$pred, nm[4], fits[[4]]$r2, delta_bic[4])
+
+# Reduce repeated axis titles only (tick labels stay)
+pA <- pA + ggplot2::theme(axis.title.x = ggplot2::element_blank())
+pB <- pB + ggplot2::theme(axis.title.x = ggplot2::element_blank(),
+                          axis.title.y = ggplot2::element_blank())
+pD <- pD + ggplot2::theme(axis.title.y = ggplot2::element_blank())
+
+# =============================================================================
+# 5) Shared legend + assemble + print
+# =============================================================================
+legend_plot <- ggplot2::ggplot(df, ggplot2::aes(Mass_g, logSigma, color = Diet_5Cat)) +
+  ggplot2::geom_point(size = 1.2, alpha = 0.65) +
+  ggplot2::scale_color_manual(values = diet_pal, labels = diet_labels, name = "Diet", drop = FALSE) +
+  ggplot2::guides(color = ggplot2::guide_legend(nrow = 1, byrow = TRUE)) +
+  ggplot2::theme_void(base_size = 12) +
+  ggplot2::theme(
+    legend.position = "bottom",
+    legend.title = ggplot2::element_text(face = "bold"),
+    legend.text  = ggplot2::element_text(color = "grey15")
+  )
+
+leg <- cowplot::get_legend(legend_plot)
+
+grid <- cowplot::plot_grid(
+  pA, pB, pC, pD,
+  ncol = 2,
+  labels = c("(a)", "(b)", "(c)", "(d)"),
+  label_fontface = "bold",
+  label_size = 14,
+  align = "hv"
+)
+
+figS_models_compare <- cowplot::plot_grid(grid, leg, ncol = 1, rel_heights = c(1, 0.10))
+
+figS_models_compare
+save_manuscript_figure(figS_models_compare, "bird_sigma_models")
+```
+
